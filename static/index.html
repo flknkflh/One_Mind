@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ONE_MIND</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20260707-session1">
+</head>
+<body>
+  <main class="shell">
+    <section class="topbar">
+      <div>
+        <h1>ONE_MIND</h1>
+        <p>Drive terenkripsi zero-knowledge untuk file internal dan intranet.</p>
+      </div>
+      <div class="session">
+        <span id="sessionText">Belum login</span>
+        <button id="logoutBtn" class="ghost hidden">Logout</button>
+      </div>
+    </section>
+
+    <section id="authView" class="grid two">
+      <form id="registerForm" class="panel">
+        <h2>Daftar</h2>
+        <div class="warningBox">
+          <strong>Kunci dekripsi dibuat di browser ini.</strong>
+          <p>Simpan password dengan aman dan jangan hapus data browser sebelum kunci lokal dicadangkan. Server tidak menyimpan private key untuk membuka file.</p>
+        </div>
+        <label>Username<input name="username" autocomplete="username" required minlength="3"></label>
+        <label>Nama tampilan<input name="display_name" required></label>
+        <label>Password<input name="password" type="password" autocomplete="new-password" required minlength="8"></label>
+        <button type="submit">Buat akun dan keypair</button>
+      </form>
+
+      <form id="loginForm" class="panel">
+        <h2>Login</h2>
+        <label>Username<input name="username" autocomplete="username" required></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit">Login</button>
+      </form>
+    </section>
+
+    <section id="appView" class="hidden">
+      <div class="appChrome">
+        <aside class="sidebar">
+          <nav class="tabs">
+            <button data-tab="files" class="active">File Saya</button>
+            <button data-tab="upload">Upload Terenkripsi</button>
+            <button data-tab="share">Bagikan Kunci</button>
+            <button data-tab="users">Direktori User</button>
+            <button data-tab="keys">Kunci Lokal</button>
+          </nav>
+          <div class="statusCard">
+            <span>Transport</span>
+            <strong>HTTPS/TLS aktif</strong>
+          </div>
+          <div class="statusCard">
+            <span>Model keamanan</span>
+            <strong>Zero-knowledge file</strong>
+          </div>
+        </aside>
+
+        <div class="workspace">
+          <section class="metrics">
+            <div>
+              <span>Total akses</span>
+              <strong id="totalFiles">0</strong>
+            </div>
+            <div>
+              <span>Milik saya</span>
+              <strong id="ownedFiles">0</strong>
+            </div>
+            <div>
+              <span>Dibagikan</span>
+              <strong id="sharedFiles">0</strong>
+            </div>
+            <div>
+              <span>User lain</span>
+              <strong id="userCount">0</strong>
+            </div>
+          </section>
+
+          <section id="filesTab" class="tab">
+            <div class="panel">
+              <div class="panelHead">
+                <div>
+                  <h2>File tersedia</h2>
+                  <p>Semua file yang bisa dibuka oleh akun ini.</p>
+                </div>
+                <button id="refreshFilesBtn" class="ghost">Muat ulang</button>
+              </div>
+              <div class="toolbar">
+                <label class="searchBox">Search
+                  <input id="fileSearch" type="search" placeholder="Cari nama file, owner, role...">
+                </label>
+                <label class="filterBox">Filter
+                  <select id="fileScope">
+                    <option value="all">Semua file akses saya</option>
+                    <option value="owned">Milik saya</option>
+                    <option value="shared">Dibagikan ke saya</option>
+                    <option value="editor">Saya editor</option>
+                    <option value="viewer">Saya viewer</option>
+                  </select>
+                </label>
+              </div>
+              <div id="fileList" class="list"></div>
+            </div>
+          </section>
+
+          <section id="uploadTab" class="tab hidden">
+            <form id="uploadForm" class="panel uploadPanel">
+              <div>
+                <h2>Upload file terenkripsi</h2>
+                <p>File dienkripsi di browser sebelum masuk server. Server hanya menerima ciphertext.</p>
+              </div>
+              <label class="fileDrop">Pilih file
+                <input name="file" type="file" required>
+              </label>
+              <button type="submit">Enkripsi di browser dan upload</button>
+            </form>
+          </section>
+
+          <section id="shareTab" class="tab hidden">
+            <form id="shareForm" class="panel">
+              <h2>Bagikan akses file</h2>
+              <p>Pilih file milik Anda, minta public key penerima dari server, lalu bungkus AES file key untuk penerima.</p>
+              <label>File<select name="file_id" required></select></label>
+              <label>Penerima<select name="recipient" required></select></label>
+              <label>Hak akses
+                <select name="permission" required>
+                  <option value="viewer">Viewer - bisa melihat/download</option>
+                  <option value="editor">Editor - bisa update file dan rotate key</option>
+                </select>
+              </label>
+              <button type="submit">Bungkus kunci untuk penerima</button>
+            </form>
+            <div class="panel accessPanel">
+              <div class="panelHead">
+                <div>
+                  <h2>Kelola akses</h2>
+                  <p>Pilih file untuk melihat siapa saja yang punya akses dan cabut akses jika perlu.</p>
+                </div>
+                <button id="loadAccessBtn" class="ghost" type="button">Lihat akses</button>
+                <button id="rotateKeyBtn" type="button">Rotate key file</button>
+              </div>
+              <div id="accessList" class="list"></div>
+            </div>
+          </section>
+
+          <section id="usersTab" class="tab hidden">
+            <div class="panel">
+              <div class="panelHead">
+                <div>
+                  <h2>Direktori user</h2>
+                  <p>Akun lain yang bisa menerima share. File mereka tetap tidak terlihat kecuali mereka memberi akses.</p>
+                </div>
+              </div>
+              <div class="toolbar">
+                <label class="searchBox">Search user
+                  <input id="userSearch" type="search" placeholder="Cari nama, username...">
+                </label>
+              </div>
+              <div id="userList" class="list"></div>
+            </div>
+          </section>
+
+          <section id="keysTab" class="tab hidden">
+            <div class="panel">
+              <h2>Kunci lokal browser</h2>
+              <p id="localKeyStatus" class="keyStatus">Memeriksa kunci lokal...</p>
+              <div class="warningBox">
+                <strong>Backup file server tidak sama dengan backup kunci user.</strong>
+                <p>Private key DIPP akun ini disimpan di localStorage browser dalam bentuk terenkripsi memakai password akun. Jika data browser, profil browser, atau perangkat hilang, file lama tidak bisa didekripsi dari server saja.</p>
+              </div>
+              <div class="safeSteps">
+                <h3>Tata cara aman sebelum pindah perangkat</h3>
+                <ol>
+                  <li>Pastikan masih bisa login dan mengunduh file dari browser lama.</li>
+                  <li>Jangan hapus cache, localStorage, profil browser, atau instal ulang sistem sebelum semua file penting berhasil dibuka di perangkat baru.</li>
+                  <li>Simpan password akun di password manager atau catatan offline yang aman.</li>
+                  <li>Untuk migrasi server, backup volume <code>one_mind_data</code>. Untuk pindah perangkat, export encrypted private key lalu simpan file backup dan password backup secara terpisah.</li>
+                </ol>
+              </div>
+              <div class="keyActions">
+                <button id="unlockKeyBtn" type="button">Unlock private key session</button>
+                <button id="lockKeyBtn" class="ghost hidden" type="button">Lock session sekarang</button>
+                <button id="exportKeyBtn" type="button">Export encrypted private key</button>
+                <label class="importKeyControl">
+                  Import encrypted private key
+                  <input id="importKeyInput" type="file" accept=".one-mind-key,.json,application/json">
+                </label>
+              </div>
+              <button id="forgetLocalBtn" class="danger">Hapus kunci lokal perangkat ini</button>
+            </div>
+          </section>
+        </div>
+      </div>
+    </section>
+
+    <section id="notice" class="notice hidden"></section>
+    <input id="updateFileInput" class="hidden" type="file">
+  </main>
+  <script src="/static/app.js?v=20260707-session1"></script>
+</body>
+</html>

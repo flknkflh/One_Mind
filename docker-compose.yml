@@ -1,0 +1,23 @@
+services:
+  one-mind:
+    build: .
+    container_name: one_mind
+    ports:
+      - "8443:8443"
+    environment:
+      ONE_MIND_DATA_DIR: /app/data
+      ONE_MIND_HOST: 0.0.0.0
+      ONE_MIND_PORT: 8443
+      ONE_MIND_TLS_MODE: internal
+      ONE_MIND_ALLOWED_HOSTS: ${ONE_MIND_ALLOWED_HOSTS:-*}
+      ONE_MIND_SESSION_SECONDS: ${ONE_MIND_SESSION_SECONDS:-43200}
+      ONE_MIND_LOGIN_MAX_FAILURES: ${ONE_MIND_LOGIN_MAX_FAILURES:-8}
+      ONE_MIND_LOGIN_WINDOW_SECONDS: ${ONE_MIND_LOGIN_WINDOW_SECONDS:-600}
+    volumes:
+      - one_mind_data:/app/data
+      - one_mind_certs:/app/certs
+    restart: unless-stopped
+
+volumes:
+  one_mind_data:
+  one_mind_certs:

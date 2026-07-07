@@ -1,0 +1,40 @@
+services:
+  one-mind:
+    build: .
+    container_name: one_mind
+    expose:
+      - "8080"
+    environment:
+      ONE_MIND_DATA_DIR: /app/data
+      ONE_MIND_HOST: 0.0.0.0
+      ONE_MIND_PORT: 8080
+      ONE_MIND_TLS_MODE: off
+      ONE_MIND_ALLOWED_HOSTS: ${ONE_MIND_ALLOWED_HOSTS}
+      ONE_MIND_SESSION_SECONDS: ${ONE_MIND_SESSION_SECONDS:-43200}
+      ONE_MIND_LOGIN_MAX_FAILURES: ${ONE_MIND_LOGIN_MAX_FAILURES:-8}
+      ONE_MIND_LOGIN_WINDOW_SECONDS: ${ONE_MIND_LOGIN_WINDOW_SECONDS:-600}
+    volumes:
+      - one_mind_data:/app/data
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: one_mind_caddy
+    depends_on:
+      - one-mind
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      ONE_MIND_DOMAIN: ${ONE_MIND_DOMAIN}
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
+volumes:
+  one_mind_data:
+  caddy_data:
+  caddy_config:
