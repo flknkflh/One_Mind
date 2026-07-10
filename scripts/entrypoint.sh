@@ -8,7 +8,15 @@ HOST="${ONE_MIND_HOST:-0.0.0.0}"
 PORT="${ONE_MIND_PORT:-8443}"
 TLS_MODE="${ONE_MIND_TLS_MODE:-internal}"
 
-mkdir -p "$CERT_DIR" "${ONE_MIND_DATA_DIR:-/app/data}"
+DATA_DIR="${ONE_MIND_DATA_DIR:-/app/data}"
+
+mkdir -p \
+    "$CERT_DIR" \
+    "$DATA_DIR" \
+    "$DATA_DIR/database" \
+    "$DATA_DIR/storage" \
+    "$DATA_DIR/keys" \
+    "$DATA_DIR/backup"
 
 if [ "$TLS_MODE" = "off" ]; then
   echo "ONE_MIND aktif di http://$HOST:$PORT di belakang reverse proxy TLS"

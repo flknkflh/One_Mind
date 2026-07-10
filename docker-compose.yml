@@ -14,10 +14,7 @@ services:
       ONE_MIND_LOGIN_MAX_FAILURES: ${ONE_MIND_LOGIN_MAX_FAILURES:-8}
       ONE_MIND_LOGIN_WINDOW_SECONDS: ${ONE_MIND_LOGIN_WINDOW_SECONDS:-600}
     volumes:
-      - one_mind_data:/app/data
-      - one_mind_certs:/app/certs
+      - ./data:/app/data
+      - ./certs:/app/certs
     restart: unless-stopped
 
-volumes:
-  one_mind_data:
-  one_mind_certs:

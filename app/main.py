@@ -19,9 +19,9 @@ from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("ONE_MIND_DATA_DIR", APP_DIR / "data"))
-DB_PATH = DATA_DIR / "one_mind.sqlite3"
+DB_PATH = DATA_DIR / "database" / "one_mind.sqlite3"
 STORAGE_DIR = DATA_DIR / "storage"
-SECRET_PATH = DATA_DIR / "server_secret.bin"
+SECRET_PATH = DATA_DIR / "keys" / "server_secret.bin"
 
 PBKDF2_ITERATIONS = 390_000
 SESSION_SECONDS = int(os.environ.get("ONE_MIND_SESSION_SECONDS", "43200"))
@@ -46,9 +46,18 @@ def b64d(text: str) -> bytes:
 def new_id(n: int = 16) -> str:
     return secrets.token_hex(n // 2)
 
+def envelope_path(file_id: str, create_dir: bool = True) -> Path:
+    shard = file_id[:2].lower()
+    folder = STORAGE_DIR / shard
+
+    if create_dir:
+        folder.mkdir(parents=True, exist_ok=True)
+
+    return folder / f"{file_id}.json"
+
 
 def get_secret() -> bytes:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not SECRET_PATH.exists():
         SECRET_PATH.write_bytes(secrets.token_bytes(32))
     return SECRET_PATH.read_bytes()
@@ -154,7 +163,9 @@ def access_usernames(conn: sqlite3.Connection, file_id: str) -> set[str]:
 
 def db() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -357,8 +368,12 @@ def user_public_key(target_username: str, username: str = Depends(current_user))
 def upload_file(data: FileUploadIn, username: str = Depends(current_user)):
     file_id = new_id()
     envelope_name = f"{file_id}.json"
-    envelope_bytes = json.dumps(data.envelope).encode("utf-8")
-    (STORAGE_DIR / envelope_name).write_bytes(envelope_bytes)
+    envelope_bytes = json.dumps(
+    data.envelope,
+    ensure_ascii=False,
+    separators=(",", ":")
+    ).encode("utf-8")
+    envelope_path(file_id).write_bytes(envelope_bytes)
 
     conn = db()
     conn.execute(
@@ -407,7 +422,7 @@ def download_file(file_id: str, username: str = Depends(current_user)):
     conn.close()
     if not row:
         raise HTTPException(status_code=404, detail="File tidak ditemukan atau belum dibagikan ke akun ini.")
-    envelope_path = STORAGE_DIR / row["envelope_name"]
+    env_path = envelope_path(row["id"], create_dir=False)
     return {
         "id": row["id"],
         "owner": row["owner"],
@@ -466,12 +481,16 @@ def update_file(file_id: str, data: FileUpdateIn, username: str = Depends(curren
             status_code=400,
             detail="Wrapped key harus dibuat ulang untuk semua user yang masih punya akses.",
         )
-    row = conn.execute("SELECT envelope_name FROM files WHERE id=?", (file_id,)).fetchone()
+    row = conn.execute("SELECT id FROM files WHERE id=?", (file_id,)).fetchone()
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="File tidak ditemukan.")
-    envelope_bytes = json.dumps(data.envelope).encode("utf-8")
-    (STORAGE_DIR / row["envelope_name"]).write_bytes(envelope_bytes)
+    envelope_bytes = json.dumps(
+        data.envelope,
+        ensure_ascii=False,
+        separators=(",", ":")
+    ).encode("utf-8")
+    envelope_path(file_id).write_bytes(envelope_bytes)
     conn.execute(
         "UPDATE files SET filename=?, encrypted_size=? WHERE id=?",
         (data.filename, len(envelope_bytes), file_id),
@@ -496,9 +515,9 @@ def delete_file(file_id: str, username: str = Depends(current_user)):
     conn.commit()
     conn.close()
     if row:
-        envelope_path = STORAGE_DIR / row["envelope_name"]
-        if envelope_path.exists():
-            envelope_path.unlink()
+        env_path = envelope_path(file_id, create_dir=False)
+        if env_path.exists():
+            env_path.unlink()
     return {"ok": True}
 
 
