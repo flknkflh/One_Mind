@@ -16,6 +16,13 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 const BACKUP_KEY_ITERATIONS = 600000;
 const SESSION_UNLOCK_MS = 15 * 60 * 1000;
+const CHUNK_PROFILES = [
+    { maxSize: 10 * 1024 * 1024, chunkSize: null },                 // ≤10 MB
+    { maxSize: 100 * 1024 * 1024, chunkSize: 1 * 1024 * 1024 },     // 1 MB
+    { maxSize: 1024 * 1024 * 1024, chunkSize: 4 * 1024 * 1024 },    // 4 MB
+    { maxSize: 10 * 1024 * 1024 * 1024, chunkSize: 8 * 1024 * 1024 }, // 8 MB
+    { maxSize: Infinity, chunkSize: 16 * 1024 * 1024 },             // 16 MB
+];
 
 function $(id) { return document.getElementById(id); }
 
@@ -68,6 +75,65 @@ function b64ToBytes(text) {
   const out = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
   return out;
+}
+
+function chooseChunkSize(fileSize) {
+  for (const profile of CHUNK_PROFILES) {
+    if (fileSize <= profile.maxSize) {
+      return profile.chunkSize;
+    }
+  }
+
+  return 16 * 1024 * 1024;
+}
+
+async function splitFileIntoChunks(file) {
+
+    const chunkSize = chooseChunkSize(file.size);
+
+    // File kecil → upload biasa
+    if (chunkSize === null) {
+        return [{
+            index: 0,
+            total: 1,
+            size: file.size,
+            blob: file
+        }];
+    }
+
+    const chunks = [];
+    let offset = 0;
+    let index = 0;
+
+    while (offset < file.size) {
+
+        const end = Math.min(offset + chunkSize, file.size);
+
+        chunks.push({
+            index,
+            total: Math.ceil(file.size / chunkSize),
+            size: end - offset,
+            blob: file.slice(offset, end)
+        });
+
+        offset = end;
+        index++;
+    }
+
+    return chunks;
+}
+
+async function analyzeFileForUpload(file) {
+
+    const chunks = await splitFileIntoChunks(file);
+
+    return {
+        fileName: file.name,
+        fileSize: file.size,
+        chunkSize: chooseChunkSize(file.size),
+        totalChunks: chunks.length,
+        chunks
+    };
 }
 
 async function api(path, options = {}) {
