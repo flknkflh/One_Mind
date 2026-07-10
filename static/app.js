@@ -796,19 +796,32 @@ on("loginForm", "submit", async (evt) => {
 });
 
 on("uploadForm", "submit", async (evt) => {
-  evt.preventDefault();
-  const file = new FormData(evt.currentTarget).get("file");
-  if (!file || !file.size) return;
-  const me = await api("/api/me");
-  const encrypted = await encryptFile(file);
-  const wrapped = await wrapFileKey(encrypted.key, me.public_key);
-  await api("/api/files", {
-    method: "POST",
-    body: JSON.stringify({filename: file.name, envelope: encrypted.envelope, wrapped_key_for_owner: wrapped}),
-  });
-  evt.currentTarget.reset();
-  await refreshAll();
-  showNotice("File dienkripsi di browser dan berhasil diupload.");
+    evt.preventDefault();
+
+    const form = evt.currentTarget;
+
+    try {
+        const file = new FormData(form).get("file");
+        if (!file || !file.size) return;
+
+        const me = await api("/api/me");
+        const encrypted = await encryptFile(file);
+        const wrapped = await wrapFileKey(encrypted.key, me.public_key);
+
+        await api("/api/files", {
+            method: "POST",
+            body: JSON.stringify({
+                filename: file.name,
+                envelope: encrypted.envelope,
+                wrapped_key_for_owner: wrapped
+            }),
+        });
+
+        await refreshAll();
+        showNotice("Upload berhasil.");
+    } finally {
+        form.reset();
+    }
 });
 
 on("shareForm", "submit", async (evt) => {
