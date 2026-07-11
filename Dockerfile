@@ -6,7 +6,15 @@ ENV ONE_MIND_DATA_DIR=/app/data
 
 WORKDIR /app
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        sqlite3 \
+        curl \
+        procps && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
@@ -16,4 +24,5 @@ COPY scripts ./scripts
 RUN chmod +x /app/scripts/entrypoint.sh
 
 EXPOSE 8443
+
 CMD ["/app/scripts/entrypoint.sh"]

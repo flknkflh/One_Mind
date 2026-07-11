@@ -16,7 +16,8 @@ mkdir -p \
     "$DATA_DIR/database" \
     "$DATA_DIR/storage" \
     "$DATA_DIR/keys" \
-    "$DATA_DIR/backup"
+    "$DATA_DIR/backup" \
+    "$DATA_DIR/temp_uploads"
 
 if [ "$TLS_MODE" = "off" ]; then
   echo "ONE_MIND aktif di http://$HOST:$PORT di belakang reverse proxy TLS"

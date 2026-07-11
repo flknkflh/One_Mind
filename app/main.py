@@ -6,7 +6,8 @@ import os
 import secrets
 import sqlite3
 import time
-from datetime import datetime, timezone
+import shutil
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -21,6 +22,7 @@ APP_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("ONE_MIND_DATA_DIR", APP_DIR / "data"))
 DB_PATH = DATA_DIR / "database" / "one_mind.sqlite3"
 STORAGE_DIR = DATA_DIR / "storage"
+TEMP_UPLOAD_DIR = DATA_DIR / "temp_uploads"
 SECRET_PATH = DATA_DIR / "keys" / "server_secret.bin"
 
 PBKDF2_ITERATIONS = 390_000
@@ -34,6 +36,79 @@ FAILED_LOGINS: dict[str, list[float]] = {}
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+def merge_chunks(upload_id: str) -> Path:
+
+    upload_dir = TEMP_UPLOAD_DIR / upload_id
+
+    merged_path = upload_dir / "merged_ciphertext.bin"
+
+    with open(merged_path, "wb") as merged:
+
+        chunk_files = sorted(
+            upload_dir.glob("chunk_*.bin")
+        )
+
+        if not chunk_files:
+            raise RuntimeError(
+                "Tidak ada chunk yang ditemukan."
+            )
+
+        for chunk in chunk_files:
+
+            with open(chunk, "rb") as f:
+
+                shutil.copyfileobj(
+                    f,
+                    merged
+                )
+
+    return merged_path
+
+def cleanup_upload_sessions():
+
+    conn = db()
+
+    rows = conn.execute(
+        """
+        SELECT
+            id,
+            expires_at
+        FROM upload_sessions;
+        """
+    ).fetchall()
+
+    now = datetime.now(timezone.utc)
+
+    for row in rows:
+
+        upload_id = row["id"]
+
+        expires_at = datetime.fromisoformat(
+            row["expires_at"]
+        )
+
+        if expires_at <= now:
+
+            upload_dir = TEMP_UPLOAD_DIR / upload_id
+
+            try:
+
+                if upload_dir.exists():
+                    shutil.rmtree(upload_dir)
+
+                conn.execute(
+                    "DELETE FROM upload_sessions WHERE id=?",
+                    (upload_id,)
+                )
+
+            except Exception as e:
+
+                print(
+                    f"[Cleanup] Failed to remove upload session {upload_id}: {e}"
+                )
+
+    conn.commit()
+    conn.close()
 
 def b64e(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
@@ -165,6 +240,7 @@ def db() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -201,6 +277,20 @@ def db() -> sqlite3.Connection:
             FOREIGN KEY(file_id) REFERENCES files(id),
             FOREIGN KEY(owner) REFERENCES users(username),
             FOREIGN KEY(recipient) REFERENCES users(username)
+        );
+        """
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS upload_sessions (
+            id TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            chunk_size INTEGER NOT NULL,
+            total_chunks INTEGER NOT NULL,
+            uploaded_chunks INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
         );
         """
     )
@@ -241,7 +331,23 @@ class ShareIn(BaseModel):
     recipient: str
     wrapped_key: dict
     permission: Literal["viewer", "editor"] = "viewer"
+class UploadStartIn(BaseModel):
+    filename: str
+    file_size: int
+    chunk_size: int
+    total_chunks: int
 
+class UploadChunkIn(BaseModel):
+    upload_id: str
+    chunk_index: int
+    total_chunks: int
+    data_b64: str
+
+class UploadFinishIn(BaseModel):
+    upload_id: str
+    envelope: dict
+    wrapped_key_for_owner: dict
+    ciphertext_sha256: str
 
 class WrappedKeyIn(BaseModel):
     recipient: str
@@ -363,31 +469,346 @@ def user_public_key(target_username: str, username: str = Depends(current_user))
         raise HTTPException(status_code=404, detail="User tidak ditemukan.")
     return {"username": row["username"], "display_name": row["display_name"], "public_key": json.loads(row["public_key"])}
 
+@app.post("/api/upload/start")
+def upload_start(
+    data: UploadStartIn,
+    username: str = Depends(current_user)
+):
+    cleanup_upload_sessions()
 
-@app.post("/api/files")
-def upload_file(data: FileUploadIn, username: str = Depends(current_user)):
-    file_id = new_id()
-    envelope_name = f"{file_id}.json"
-    envelope_bytes = json.dumps(
-    data.envelope,
-    ensure_ascii=False,
-    separators=(",", ":")
-    ).encode("utf-8")
-    envelope_path(file_id).write_bytes(envelope_bytes)
+    upload_id = new_id()
+
+    upload_dir = TEMP_UPLOAD_DIR / upload_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
 
     conn = db()
+
+    expires_at = (
+        datetime.now(timezone.utc)
+        + timedelta(hours=24)
+    ).isoformat(timespec="seconds")
+
     conn.execute(
-        "INSERT INTO files (id, owner, filename, envelope_name, encrypted_size, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (file_id, username, data.filename, envelope_name, len(envelope_bytes), now_iso()),
+        """
+        INSERT INTO upload_sessions (
+            id,
+            owner,
+            filename,
+            file_size,
+            chunk_size,
+            total_chunks,
+            uploaded_chunks,
+            created_at,
+            expires_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            upload_id,
+            username,
+            data.filename,
+            data.file_size,
+            data.chunk_size,
+            data.total_chunks,
+            0,
+            now_iso(),
+            expires_at,
+        )
     )
-    conn.execute(
-        "INSERT INTO shares (id, file_id, owner, recipient, wrapped_key, permission, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (new_id(), file_id, username, username, json.dumps(data.wrapped_key_for_owner), "owner", now_iso()),
-    )
+
     conn.commit()
     conn.close()
-    return {"file_id": file_id}
 
+    return {
+        "upload_id": upload_id
+    }
+
+@app.post("/api/upload/chunk")
+def upload_chunk(
+    data: UploadChunkIn,
+    username: str = Depends(current_user)
+):
+
+    conn = db()
+
+    row = conn.execute(
+        """
+        SELECT owner, total_chunks
+        FROM upload_sessions
+        WHERE id = ?;
+        """,
+        (data.upload_id,)
+    ).fetchone()
+
+    if row is None:
+        conn.close()
+        raise HTTPException(
+            status_code=404,
+            detail="Upload session tidak ditemukan."
+        )
+
+    if row["owner"] != username:
+        conn.close()
+        raise HTTPException(
+            status_code=403,
+            detail="Upload session bukan milik Anda."
+        )
+
+    if data.chunk_index < 0:
+        conn.close()
+        raise HTTPException(
+            status_code=400,
+            detail="chunk_index tidak boleh negatif."
+        )
+
+    if data.chunk_index >= row["total_chunks"]:
+        conn.close()
+        raise HTTPException(
+            status_code=400,
+            detail="chunk_index melebihi total_chunks."
+        )
+
+    upload_dir = TEMP_UPLOAD_DIR / data.upload_id
+
+    if not upload_dir.exists():
+        conn.close()
+        raise HTTPException(
+            status_code=404,
+            detail="Folder upload tidak ditemukan."
+        )
+
+    chunk_path = (
+        upload_dir /
+        f"chunk_{data.chunk_index:06d}.bin"
+    )
+
+    # Jika chunk sudah pernah diterima, jangan hitung lagi
+    if chunk_path.exists():
+        conn.close()
+        return {
+            "message": "Chunk already received."
+        }
+
+    try:
+        chunk_bytes = base64.b64decode(data.data_b64)
+
+        chunk_path.write_bytes(chunk_bytes)
+
+        conn.execute(
+            """
+            UPDATE upload_sessions
+            SET uploaded_chunks = uploaded_chunks + 1
+            WHERE id = ?;
+            """,
+            (data.upload_id,)
+        )
+
+        conn.commit()
+
+    except Exception as e:
+
+        conn.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gagal menyimpan chunk: {e}"
+        )
+
+    finally:
+        conn.close()
+
+    return {
+        "chunk": data.chunk_index,
+        "received": len(chunk_bytes)
+    }
+
+@app.post("/api/upload/finish")
+def upload_finish(
+    data: UploadFinishIn,
+    username: str = Depends(current_user)
+):
+
+    conn = db()
+
+    envelope_file = None
+
+    try:
+
+        row = conn.execute(
+            """
+            SELECT
+                owner,
+                filename,
+                uploaded_chunks,
+                total_chunks
+            FROM upload_sessions
+            WHERE id = ?;
+            """,
+            (data.upload_id,)
+        ).fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Upload session tidak ditemukan."
+            )
+
+        if row["owner"] != username:
+            raise HTTPException(
+                status_code=403,
+                detail="Upload session bukan milik Anda."
+            )
+
+        if row["uploaded_chunks"] != row["total_chunks"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Masih ada chunk yang belum diterima."
+            )
+
+        merged_path = merge_chunks(
+            data.upload_id
+        )
+
+        if not merged_path.exists():
+            raise HTTPException(
+                status_code=500,
+                detail="Gagal menggabungkan chunk."
+            )
+
+        merged_bytes = merged_path.read_bytes()
+
+        if len(merged_bytes) == 0:
+            raise HTTPException(
+                status_code=500,
+                detail="Hasil merge kosong."
+            )
+
+        # ====================================================
+        # INTEGRITY CHECK (BARU)
+        # ====================================================
+
+        server_sha256 = base64.b64encode(
+            hashlib.sha256(
+                merged_bytes
+            ).digest()
+        ).decode("ascii")
+
+        if server_sha256 != data.ciphertext_sha256:
+            raise HTTPException(
+                status_code=409,
+                detail="Integrity check gagal. Ciphertext berubah selama upload."
+            )
+
+        # ====================================================
+
+        file_id = new_id()
+
+        envelope = data.envelope.copy()
+
+        envelope["ciphertext_b64"] = base64.b64encode(
+            merged_bytes
+        ).decode("ascii")
+
+        envelope_bytes = json.dumps(
+            envelope,
+            ensure_ascii=False,
+            separators=(",", ":")
+        ).encode("utf-8")
+
+        envelope_name = f"{file_id}.json"
+
+        envelope_file = envelope_path(file_id)
+
+        envelope_file.write_bytes(
+            envelope_bytes
+        )
+
+        conn.execute(
+            """
+            INSERT INTO files
+            (
+                id,
+                owner,
+                filename,
+                envelope_name,
+                encrypted_size,
+                created_at
+            )
+            VALUES
+            (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                file_id,
+                username,
+                row["filename"],
+                envelope_name,
+                len(envelope_bytes),
+                now_iso()
+            )
+        )
+
+        conn.execute(
+            """
+            INSERT INTO shares
+            (
+                id,
+                file_id,
+                owner,
+                recipient,
+                wrapped_key,
+                permission,
+                created_at
+            )
+            VALUES
+            (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id(),
+                file_id,
+                username,
+                username,
+                json.dumps(data.wrapped_key_for_owner),
+                "owner",
+                now_iso()
+            )
+        )
+
+        conn.execute(
+            """
+            DELETE FROM upload_sessions
+            WHERE id = ?;
+            """,
+            (
+                data.upload_id,
+            )
+        )
+
+        conn.commit()
+
+    except Exception:
+
+        conn.rollback()
+
+        if envelope_file is not None and envelope_file.exists():
+            envelope_file.unlink()
+
+        raise
+
+    finally:
+
+        conn.close()
+
+    upload_dir = TEMP_UPLOAD_DIR / data.upload_id
+
+    if upload_dir.exists():
+        shutil.rmtree(
+            upload_dir,
+            ignore_errors=True
+        )
+
+    return {
+        "file_id": file_id
+    }
 
 @app.get("/api/files")
 def list_files(username: str = Depends(current_user)):

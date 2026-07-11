@@ -17,11 +17,37 @@ const dec = new TextDecoder();
 const BACKUP_KEY_ITERATIONS = 600000;
 const SESSION_UNLOCK_MS = 15 * 60 * 1000;
 const CHUNK_PROFILES = [
-    { maxSize: 10 * 1024 * 1024, chunkSize: null },                 // ≤10 MB
-    { maxSize: 100 * 1024 * 1024, chunkSize: 1 * 1024 * 1024 },     // 1 MB
-    { maxSize: 1024 * 1024 * 1024, chunkSize: 4 * 1024 * 1024 },    // 4 MB
-    { maxSize: 10 * 1024 * 1024 * 1024, chunkSize: 8 * 1024 * 1024 }, // 8 MB
-    { maxSize: Infinity, chunkSize: 16 * 1024 * 1024 },             // 16 MB
+
+    // ≤10 MB → tidak perlu dipecah (1 chunk)
+    {
+        maxSize: 10 * 1024 * 1024,
+        chunkSize: 10 * 1024 * 1024
+    },
+
+    // ≤100 MB → 1 MB/chunk
+    {
+        maxSize: 100 * 1024 * 1024,
+        chunkSize: 1 * 1024 * 1024
+    },
+
+    // ≤1 GB → 4 MB/chunk
+    {
+        maxSize: 1024 * 1024 * 1024,
+        chunkSize: 4 * 1024 * 1024
+    },
+
+    // ≤10 GB → 8 MB/chunk
+    {
+        maxSize: 10 * 1024 * 1024 * 1024,
+        chunkSize: 8 * 1024 * 1024
+    },
+
+    // >10 GB → 16 MB/chunk
+    {
+        maxSize: Infinity,
+        chunkSize: 16 * 1024 * 1024
+    }
+
 ];
 
 function $(id) { return document.getElementById(id); }
@@ -78,13 +104,32 @@ function b64ToBytes(text) {
 }
 
 function chooseChunkSize(fileSize) {
-  for (const profile of CHUNK_PROFILES) {
-    if (fileSize <= profile.maxSize) {
-      return profile.chunkSize;
-    }
-  }
 
-  return 16 * 1024 * 1024;
+    for (const profile of CHUNK_PROFILES) {
+
+        if (fileSize <= profile.maxSize) {
+
+            if (
+                !Number.isFinite(profile.chunkSize) ||
+                profile.chunkSize <= 0
+            ) {
+                return fileSize;
+            }
+
+            return Math.min(
+                profile.chunkSize,
+                fileSize
+            );
+
+        }
+
+    }
+
+    return Math.min(
+        16 * 1024 * 1024,
+        fileSize
+    );
+
 }
 
 async function splitFileIntoChunks(file) {
@@ -137,12 +182,47 @@ async function analyzeFileForUpload(file) {
 }
 
 async function api(path, options = {}) {
-  const headers = {"Content-Type": "application/json", ...(options.headers || {})};
-  if (state.token) headers.Authorization = `Bearer ${state.token}`;
-  const res = await fetch(path, {...options, headers});
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.detail || "Request gagal.");
-  return data;
+
+    const headers = {
+        "Content-Type": "application/json",
+        ...(options.headers || {})
+    };
+
+    if (state.token) {
+        headers.Authorization = `Bearer ${state.token}`;
+    }
+
+    const res = await fetch(
+        path,
+        {
+            ...options,
+            headers
+        }
+    );
+
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+
+        console.error("HTTP ERROR", res.status);
+
+        console.error(data);
+
+        throw new Error(
+            "HTTP " +
+            res.status +
+            "\n\n" +
+            JSON.stringify(
+                data,
+                null,
+                2
+            )
+        );
+
+    }
+
+    return data;
+
 }
 
 async function deriveLocalKey(password, username, saltB64 = null) {
@@ -569,24 +649,239 @@ async function unwrapFileKey(wrapped, privateKey) {
   return crypto.subtle.importKey("raw", raw, {name: "AES-GCM"}, true, ["encrypt", "decrypt"]);
 }
 
+async function encryptBlob(blob, fileName, mimeType, key = null) {
+
+    if (!key) {
+        key = await crypto.subtle.generateKey(
+            {
+                name: "AES-GCM",
+                length: 256
+            },
+            true,
+            ["encrypt", "decrypt"]
+        );
+    }
+
+    const iv = crypto.getRandomValues(
+        new Uint8Array(12)
+    );
+
+    const data = new Uint8Array(
+        await blob.arrayBuffer()
+    );
+
+    const aad = enc.encode(
+        JSON.stringify({
+            filename: fileName,
+            type: mimeType || "application/octet-stream"
+        })
+    );
+
+    const cipher = await crypto.subtle.encrypt(
+        {
+            name: "AES-GCM",
+            iv,
+            additionalData: aad
+        },
+        key,
+        data
+    );
+
+    const ciphertext = new Uint8Array(cipher);
+
+    // ===== BARU =====
+
+    const digest = await crypto.subtle.digest(
+        "SHA-256",
+        ciphertext
+    );
+
+    const ciphertext_sha256 = bytesToB64(
+        new Uint8Array(digest)
+    );
+
+    // ================
+
+    return {
+
+        key,
+
+        envelope: {
+
+            version: 2,
+
+            algorithm: "AES-256-GCM",
+
+            filename: fileName,
+
+            mime: mimeType || "application/octet-stream",
+
+            aad_b64: bytesToB64(aad),
+
+            iv_b64: bytesToB64(iv)
+
+        },
+
+        ciphertext,
+
+        ciphertext_sha256
+
+    };
+
+}
+
 async function encryptFile(file) {
-  const key = await crypto.subtle.generateKey({name: "AES-GCM", length: 256}, true, ["encrypt", "decrypt"]);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const data = new Uint8Array(await file.arrayBuffer());
-  const aad = enc.encode(JSON.stringify({filename: file.name, type: file.type || "application/octet-stream"}));
-  const cipher = await crypto.subtle.encrypt({name: "AES-GCM", iv, additionalData: aad}, key, data);
-  return {
-    key,
-    envelope: {
-      version: 2,
-      algorithm: "AES-256-GCM",
-      filename: file.name,
-      mime: file.type || "application/octet-stream",
-      aad_b64: bytesToB64(aad),
-      iv_b64: bytesToB64(iv),
-      ciphertext_b64: bytesToB64(new Uint8Array(cipher)),
-    },
-  };
+    return encryptBlob(
+        file,
+        file.name,
+        file.type || "application/octet-stream"
+    );
+}
+
+function splitCiphertext(
+    ciphertext,
+    chunkSize
+) {
+
+    if (!(ciphertext instanceof Uint8Array)) {
+        throw new Error(
+            "ciphertext harus berupa Uint8Array."
+        );
+    }
+
+    if (
+        !Number.isFinite(chunkSize) ||
+        chunkSize <= 0
+    ) {
+        throw new Error(
+            `chunkSize tidak valid: ${chunkSize}`
+        );
+    }
+
+    const chunks = [];
+
+    const totalChunks = Math.ceil(
+        ciphertext.length / chunkSize
+    );
+
+    for (
+        let index = 0, offset = 0;
+        offset < ciphertext.length;
+        index++, offset += chunkSize
+    ) {
+
+        const end = Math.min(
+            offset + chunkSize,
+            ciphertext.length
+        );
+
+        chunks.push({
+
+            index,
+
+            total: totalChunks,
+
+            bytes: ciphertext.slice(
+                offset,
+                end
+            )
+
+        });
+
+    }
+
+    return chunks;
+
+}
+
+async function uploadCiphertext(
+    encrypted,
+    wrappedKey,
+    file
+) {
+
+    const chunkSize =
+        chooseChunkSize(
+            encrypted.ciphertext.length
+        );
+
+    const chunks =
+        splitCiphertext(
+            encrypted.ciphertext,
+            chunkSize
+        );
+
+    const session =
+        await api(
+            "/api/upload/start",
+            {
+                method: "POST",
+                body: JSON.stringify({
+
+                    filename: file.name,
+
+                    file_size: encrypted.ciphertext.length,
+
+                    chunk_size: chunkSize,
+
+                    total_chunks: chunks.length
+
+                })
+            }
+        );
+
+    return {
+
+        session,
+
+        chunks
+
+    };
+
+}
+
+async function uploadChunks(session, chunks) {
+    for (const chunk of chunks) {
+        await api(
+            "/api/upload/chunk",
+            {
+                method: "POST",
+                body: JSON.stringify({
+                    upload_id: session.upload_id,
+                    chunk_index: chunk.index,
+                    total_chunks: chunk.total,
+                    data_b64: bytesToB64(chunk.bytes)
+                })
+            }
+        );
+
+    }
+}
+
+async function uploadFinish(
+    session,
+    encrypted,
+    wrappedKey
+) {
+
+    return await api(
+        "/api/upload/finish",
+        {
+            method: "POST",
+            body: JSON.stringify({
+
+                upload_id: session.upload_id,
+
+                envelope: encrypted.envelope,
+
+                wrapped_key_for_owner: wrappedKey,
+
+                ciphertext_sha256:
+                    encrypted.ciphertext_sha256
+
+            })
+        }
+    );
 }
 
 async function decryptEnvelope(envelope, key) {
@@ -862,32 +1157,65 @@ on("loginForm", "submit", async (evt) => {
 });
 
 on("uploadForm", "submit", async (evt) => {
+
     evt.preventDefault();
 
     const form = evt.currentTarget;
 
     try {
+
         const file = new FormData(form).get("file");
-        if (!file || !file.size) return;
+
+        if (!file || !file.size) {
+            return;
+        }
 
         const me = await api("/api/me");
-        const encrypted = await encryptFile(file);
-        const wrapped = await wrapFileKey(encrypted.key, me.public_key);
 
-        await api("/api/files", {
-            method: "POST",
-            body: JSON.stringify({
-                filename: file.name,
-                envelope: encrypted.envelope,
-                wrapped_key_for_owner: wrapped
-            }),
-        });
+        const encrypted = await encryptFile(file);
+
+        const wrapped = await wrapFileKey(
+            encrypted.key,
+            me.public_key
+        );
+
+        const upload = await uploadCiphertext(
+            encrypted,
+            wrapped,
+            file
+        );
+
+        await uploadChunks(
+            upload.session,
+            upload.chunks
+        );
+
+        const result = await uploadFinish(
+            upload.session,
+            encrypted,
+            wrapped
+        );
+
+        console.log(result);
+
+        showNotice("Upload selesai.");
 
         await refreshAll();
-        showNotice("Upload berhasil.");
-    } finally {
-        form.reset();
+
     }
+    catch (err) {
+
+        console.error(err);
+
+        alert(err.stack || err.message);
+
+    }
+    finally {
+
+        form.reset();
+
+    }
+
 });
 
 on("shareForm", "submit", async (evt) => {
