@@ -831,28 +831,41 @@ def list_files(username: str = Depends(current_user)):
 @app.get("/api/files/{file_id}")
 def download_file(file_id: str, username: str = Depends(current_user)):
     conn = db()
+
     row = conn.execute(
         """
-        SELECT f.id, f.owner, f.filename, f.envelope_name, s.wrapped_key, s.permission
+        SELECT f.id, f.owner, f.filename, f.envelope_name,
+               s.wrapped_key, s.permission
         FROM files f
-        JOIN shares s ON s.file_id = f.id
-        WHERE f.id = ? AND s.recipient = ?
+        JOIN shares s
+             ON s.file_id = f.id
+        WHERE f.id = ?
+          AND s.recipient = ?
         """,
         (file_id, username),
     ).fetchone()
+
     conn.close()
+
     if not row:
-        raise HTTPException(status_code=404, detail="File tidak ditemukan atau belum dibagikan ke akun ini.")
-    env_path = envelope_path(row["id"], create_dir=False)
+        raise HTTPException(
+            status_code=404,
+            detail="File tidak ditemukan atau belum dibagikan ke akun ini."
+        )
+
+    env_path = envelope_path(
+        row["id"],
+        create_dir=False
+    )
+
     return {
         "id": row["id"],
         "owner": row["owner"],
         "filename": row["filename"],
         "permission": row["permission"],
-        "envelope": json.loads(envelope_path.read_text()),
+        "envelope": json.loads(env_path.read_text()),
         "wrapped_key": json.loads(row["wrapped_key"]),
     }
-
 
 @app.get("/api/files/{file_id}/access")
 def file_access(file_id: str, username: str = Depends(current_user)):

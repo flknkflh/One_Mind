@@ -11,6 +11,17 @@ const state = {
   keyUnlockedUntil: 0,
   keyLockTimer: null,
 };
+let selectedDippFile = null;
+
+const dippSession = {
+
+    privateKey: null,
+
+    publicKey: null,
+
+    username: null
+
+};
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -225,32 +236,6 @@ async function api(path, options = {}) {
 
 }
 
-async function deriveLocalKey(password, username, saltB64 = null) {
-  const salt = saltB64 ? b64ToBytes(saltB64) : crypto.getRandomValues(new Uint8Array(16));
-  const base = await crypto.subtle.importKey("raw", enc.encode(`${username}:${password}`), "PBKDF2", false, ["deriveKey"]);
-  const key = await crypto.subtle.deriveKey(
-    {name: "PBKDF2", salt, iterations: 250000, hash: "SHA-256"},
-    base,
-    {name: "AES-GCM", length: 256},
-    false,
-    ["encrypt", "decrypt"]
-  );
-  return {key, saltB64: bytesToB64(salt)};
-}
-
-async function deriveBackupKey(password, username, saltB64 = null, iterations = BACKUP_KEY_ITERATIONS) {
-  const salt = saltB64 ? b64ToBytes(saltB64) : crypto.getRandomValues(new Uint8Array(16));
-  const material = `ONE_MIND backup:${username}:${password}`;
-  const base = await crypto.subtle.importKey("raw", enc.encode(material), "PBKDF2", false, ["deriveKey"]);
-  const key = await crypto.subtle.deriveKey(
-    {name: "PBKDF2", salt, iterations, hash: "SHA-256"},
-    base,
-    {name: "AES-GCM", length: 256},
-    false,
-    ["encrypt", "decrypt"]
-  );
-  return {key, saltB64: bytesToB64(salt)};
-}
 
 const DIPP_PARAMS = {
   dim: 3,
@@ -446,45 +431,163 @@ function dippUnwrapBytes(privateEntry, wrapped) {
   return bitsToBytes(bits);
 }
 
-async function createKeyBundle(username, password) {
-  const dipp = generateDippKeypair();
-  await savePrivateKey(username, password, dipp);
-  return dipp.public;
+async function createKeyBundle(username) {
+
+    const dipp = generateDippKeypair();
+
+    await exportDippIdentity(
+        username,
+        dipp
+    );
+
+    return dipp.public;
+
 }
 
-async function savePrivateKey(username, password, dipp) {
-  const {key, saltB64} = await deriveLocalKey(password, username);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const cipher = await crypto.subtle.encrypt({name: "AES-GCM", iv}, key, enc.encode(JSON.stringify(dipp)));
-  localStorage.setItem(`om_private_${username}`, JSON.stringify({
-    salt: saltB64,
-    iv: bytesToB64(iv),
-    cipher: bytesToB64(new Uint8Array(cipher)),
-  }));
-}
+async function exportDippIdentity(
+    username,
+    dipp
+) {
 
-async function loadPrivateKey(username, password) {
-  const raw = localStorage.getItem(`om_private_${username}`);
-  if (!raw) throw new Error("Private key lokal tidak ada di browser ini.");
-  const bundle = JSON.parse(raw);
-  const {key} = await deriveLocalKey(password, username, bundle.salt);
-  const plain = await crypto.subtle.decrypt(
-    {name: "AES-GCM", iv: b64ToBytes(bundle.iv)},
-    key,
-    b64ToBytes(bundle.cipher)
-  );
-  return JSON.parse(dec.decode(plain));
-}
+    const identity = {
 
+        version: 1,
+
+        type: "ONE_MIND_DIPP",
+
+        username,
+
+        created_at:
+            new Date().toISOString(),
+
+        public_key:
+            dipp.public,
+
+        private_key:
+            dipp.private
+
+    };
+
+    const blob =
+        new Blob(
+
+            [
+                JSON.stringify(
+                    identity,
+                    null,
+                    2
+                )
+            ],
+
+            {
+                type:
+                    "application/json"
+            }
+
+        );
+
+    const url =
+        URL.createObjectURL(
+            blob
+        );
+
+    const a =
+        document.createElement(
+            "a"
+        );
+
+    a.href = url;
+
+    a.download =
+        `ONE_MIND_DIPP_${username}.dipp`;
+
+    a.click();
+
+    URL.revokeObjectURL(
+        url
+    );
+
+}
+async function importDippIdentity(
+    file,
+    username
+) {
+
+    const text =
+        await file.text();
+
+    const identity =
+        JSON.parse(text);
+
+    if (
+        identity.type !==
+        "ONE_MIND_DIPP"
+    ) {
+
+        throw new Error(
+            "Bukan file Identitas DIPP ONE_MIND."
+        );
+
+    }
+
+    if (
+        identity.username !==
+        username
+    ) {
+
+        throw new Error(
+            "Identitas bukan milik user ini."
+        );
+
+    }
+
+    const dipp = {
+
+        public:
+            identity.public_key,
+
+        private:
+            identity.private_key
+
+    };
+
+    dippSession.privateKey =
+        dipp;
+
+    dippSession.publicKey =
+        dipp.public;
+
+    dippSession.username =
+        username;
+
+    state.unlockedPrivateKey =
+        dipp;
+
+    state.keyUnlockedUntil =
+        Date.now() +
+        SESSION_UNLOCK_MS;
+
+    armKeyLockTimer();
+
+    updateLocalKeyStatus();
+
+    return dipp;
+
+}
 function hasLocalPrivateKey(username = state.username) {
-  return Boolean(username && localStorage.getItem(`om_private_${username}`));
+
+    return Boolean(
+        dippSession.privateKey &&
+        dippSession.username === username
+    );
+
 }
 
 function isKeyUnlocked() {
   return Boolean(state.unlockedPrivateKey && Date.now() < state.keyUnlockedUntil);
 }
 
-function lockPrivateKeySession(reason = "Kunci lokal dikunci dari memory.") {
+function lockPrivateKeySession(reason = "Identitas DIPP telah dihapus dari memori aplikasi.") {
   state.unlockedPrivateKey = null;
   state.keyUnlockedUntil = 0;
   if (state.keyLockTimer) clearTimeout(state.keyLockTimer);
@@ -499,41 +602,86 @@ function armKeyLockTimer() {
   state.keyLockTimer = setTimeout(() => lockPrivateKeySession("Session key timeout. Unlock ulang untuk membuka file."), delay);
 }
 
-async function unlockPrivateKeySession(password) {
-  if (!state.username) throw new Error("Login diperlukan.");
-  const privateKey = await loadPrivateKey(state.username, password);
-  state.unlockedPrivateKey = privateKey;
-  state.keyUnlockedUntil = Date.now() + SESSION_UNLOCK_MS;
-  armKeyLockTimer();
-  updateLocalKeyStatus();
-  return privateKey;
+async function unlockPrivateKeySession() {
+
+    if (
+        !dippSession.privateKey
+    ) {
+
+        throw new Error(
+            "Silakan import file identitas DIPP."
+        );
+
+    }
+
+    state.unlockedPrivateKey =
+        dippSession.privateKey;
+
+    state.keyUnlockedUntil =
+        Date.now() +
+        SESSION_UNLOCK_MS;
+
+    armKeyLockTimer();
+
+    updateLocalKeyStatus();
+
+    return dippSession.privateKey;
+
 }
 
 async function ensureUnlockedPrivateKey() {
-  if (isKeyUnlocked()) return state.unlockedPrivateKey;
-  const password = prompt("Unlock private key session: masukkan password akun:");
-  if (!password) throw new Error("Unlock dibatalkan.");
-  return unlockPrivateKeySession(password);
-}
 
+    if (isKeyUnlocked()) {
+        return state.unlockedPrivateKey;
+    }
+
+    throw new Error(
+        "Private Key DIPP belum diimport. Silakan import file .dipp terlebih dahulu."
+    );
+
+}
 function updateLocalKeyStatus() {
-  const status = $("localKeyStatus");
-  if (!status || !state.username) return;
-  const hasKey = hasLocalPrivateKey();
-  const unlocked = isKeyUnlocked();
-  if (!hasKey) {
-    status.textContent = "Kunci lokal belum ada di browser ini. Import encrypted private key sebelum membuka atau membagikan file lama.";
-  } else if (unlocked) {
-    const minutes = Math.max(1, Math.ceil((state.keyUnlockedUntil - Date.now()) / 60000));
-    status.textContent = `Kunci lokal tersedia dan sedang unlocked di memory tab ini. Auto-lock sekitar ${minutes} menit lagi.`;
-  } else {
-    status.textContent = "Kunci lokal tersedia, tetapi terkunci. Unlock session sebelum download, share, update, atau export key.";
-  }
-  status.classList.toggle("missing", !hasKey);
-  status.classList.toggle("locked", hasKey && !unlocked);
-  status.classList.toggle("unlocked", hasKey && unlocked);
-  $("unlockKeyBtn")?.classList.toggle("hidden", !hasKey || unlocked);
-  $("lockKeyBtn")?.classList.toggle("hidden", !hasKey || !unlocked);
+
+    const status =
+        $("localKeyStatus");
+
+    if (!status)
+        return;
+
+    if (!state.username) {
+
+        status.textContent =
+            "Belum login.";
+
+        return;
+
+    }
+
+    const loaded =
+        Boolean(
+            dippSession.privateKey
+        );
+
+    if (!loaded) {
+
+        status.textContent =
+            "Identitas DIPP belum diimport.";
+
+        status.className =
+            "keyStatus missing";
+
+    }
+
+    else {
+
+        status.textContent =
+            "Identitas DIPP berhasil dimuat ke RAM.";
+
+        status.className =
+            "keyStatus unlocked";
+
+    }
+
 }
 
 function downloadJson(filename, data) {
@@ -546,98 +694,6 @@ function downloadJson(filename, data) {
   URL.revokeObjectURL(url);
 }
 
-async function exportPrivateKeyBackup() {
-  if (!state.username) throw new Error("Login diperlukan.");
-  if (!hasLocalPrivateKey()) throw new Error("Private key lokal belum ada di browser ini.");
-  const privateKey = await ensureUnlockedPrivateKey();
-  const backupPassword = prompt("Buat password backup khusus untuk file export:");
-  if (!backupPassword || backupPassword.length < 12) throw new Error("Password backup minimal 12 karakter.");
-  const backupPasswordAgain = prompt("Ulangi password backup:");
-  if (backupPassword !== backupPasswordAgain) throw new Error("Password backup tidak sama.");
-
-  const {key, saltB64} = await deriveBackupKey(backupPassword, state.username);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const header = {
-    app: "ONE_MIND",
-    type: "encrypted-private-key-backup",
-    version: 1,
-    username: state.username,
-    created_at: new Date().toISOString(),
-    kdf: {
-      name: "PBKDF2",
-      hash: "SHA-256",
-      iterations: BACKUP_KEY_ITERATIONS,
-      salt_b64: saltB64,
-    },
-    cipher: {
-      name: "AES-256-GCM",
-      iv_b64: bytesToB64(iv),
-    },
-  };
-  const aad = enc.encode(JSON.stringify(header));
-  const cipher = await crypto.subtle.encrypt(
-    {name: "AES-GCM", iv, additionalData: aad},
-    key,
-    enc.encode(JSON.stringify(privateKey))
-  );
-  downloadJson(`one-mind-${state.username}-private-key.one-mind-key`, {
-    ...header,
-    cipher: {...header.cipher, ciphertext_b64: bytesToB64(new Uint8Array(cipher))},
-  });
-  showNotice("Encrypted private key berhasil diexport. Simpan file dan password backup secara terpisah.");
-}
-
-async function importPrivateKeyBackup(file) {
-  if (!state.username) throw new Error("Login diperlukan sebelum import key.");
-  if (!file) return;
-  const backup = JSON.parse(await file.text());
-  if (backup.app !== "ONE_MIND" || backup.type !== "encrypted-private-key-backup" || backup.version !== 1) {
-    throw new Error("Format backup key tidak dikenali.");
-  }
-  if (backup.username !== state.username) {
-    throw new Error(`Backup ini milik akun ${backup.username}, bukan ${state.username}.`);
-  }
-  if (backup.kdf?.name !== "PBKDF2" || backup.kdf?.hash !== "SHA-256" || backup.cipher?.name !== "AES-256-GCM") {
-    throw new Error("Parameter enkripsi backup tidak didukung.");
-  }
-
-  const backupPassword = prompt("Masukkan password backup untuk membuka file export:");
-  if (!backupPassword) return;
-  const accountPassword = prompt("Masukkan password akun untuk menyimpan private key di browser ini:");
-  if (!accountPassword) return;
-  const loginCheck = await api("/api/login", {
-    method: "POST",
-    body: JSON.stringify({username: state.username, password: accountPassword}),
-  });
-  state.token = loginCheck.token;
-  localStorage.setItem("om_token", state.token);
-
-  const {key} = await deriveBackupKey(backupPassword, backup.username, backup.kdf.salt_b64, backup.kdf.iterations);
-  const aadHeader = {
-    app: backup.app,
-    type: backup.type,
-    version: backup.version,
-    username: backup.username,
-    created_at: backup.created_at,
-    kdf: backup.kdf,
-    cipher: {
-      name: backup.cipher.name,
-      iv_b64: backup.cipher.iv_b64,
-    },
-  };
-  const plain = await crypto.subtle.decrypt(
-    {name: "AES-GCM", iv: b64ToBytes(backup.cipher.iv_b64), additionalData: enc.encode(JSON.stringify(aadHeader))},
-    key,
-    b64ToBytes(backup.cipher.ciphertext_b64)
-  );
-  const privateKey = JSON.parse(dec.decode(plain));
-  await savePrivateKey(state.username, accountPassword, privateKey);
-  state.unlockedPrivateKey = privateKey;
-  state.keyUnlockedUntil = Date.now() + SESSION_UNLOCK_MS;
-  armKeyLockTimer();
-  updateLocalKeyStatus();
-  showNotice("Private key berhasil diimport ke browser ini.");
-}
 
 async function wrapFileKey(fileKey, recipientPublicKey) {
   const rawFileKey = new Uint8Array(await crypto.subtle.exportKey("raw", fileKey));
@@ -991,12 +1047,44 @@ async function rotateCurrentFileKey(fileId) {
 }
 
 function renderAuth() {
-  const loggedIn = Boolean(state.token);
-  $("authView")?.classList.toggle("hidden", loggedIn);
-  $("appView")?.classList.toggle("hidden", !loggedIn);
-  $("logoutBtn")?.classList.toggle("hidden", !loggedIn);
-  if ($("sessionText")) $("sessionText").textContent = loggedIn ? `Login sebagai ${state.username}` : "Belum login";
-  updateLocalKeyStatus();
+
+    const loggedIn = Boolean(state.token);
+
+    $("authView")?.classList.toggle("hidden", loggedIn);
+
+    $("appView")?.classList.toggle("hidden", !loggedIn);
+
+    $("logoutBtn")?.classList.toggle("hidden", !loggedIn);
+
+    if ($("sessionText")) {
+        $("sessionText").textContent = loggedIn
+            ? `Login sebagai ${state.username}`
+            : "Belum login";
+    }
+
+    if (loggedIn) {
+
+        // Sembunyikan semua tab
+        document.querySelectorAll(".tab").forEach(tab => {
+            tab.classList.add("hidden");
+        });
+
+        // Reset tombol aktif
+        document.querySelectorAll(".tabs button").forEach(btn => {
+            btn.classList.remove("active");
+        });
+
+        // Aktifkan File Saya sebagai tab default
+        $("filesTab")?.classList.remove("hidden");
+
+        document
+            .querySelector('[data-tab="files"]')
+            ?.classList.add("active");
+
+    }
+
+    updateLocalKeyStatus();
+
 }
 
 async function refreshAll() {
@@ -1110,50 +1198,282 @@ document.querySelectorAll(".tabs button").forEach(btn => {
 });
 
 on("registerForm", "submit", async (evt) => {
-  evt.preventDefault();
-  const form = new FormData(evt.currentTarget);
-  const username = form.get("username").trim();
-  const password = form.get("password");
-  const publicKey = await createKeyBundle(username, password);
-  const result = await api("/api/register", {
-    method: "POST",
-    body: JSON.stringify({
-      username,
-      display_name: form.get("display_name").trim(),
-      password,
-      public_key: publicKey,
-    }),
-  });
-  state.token = result.token;
-  state.username = result.username;
-  localStorage.setItem("om_token", state.token);
-  localStorage.setItem("om_username", state.username);
-  renderAuth();
-  await refreshAll();
-  await unlockPrivateKeySession(password);
-  showNotice("Akun dibuat. Keypair lokal sudah diamankan di browser ini.");
+
+    evt.preventDefault();
+
+    const form = new FormData(evt.currentTarget);
+
+    const username = form.get("username").trim();
+
+    const password = form.get("password");
+
+    // ============================
+    // Generate DIPP Keypair
+    // ============================
+
+    const dipp = generateDippKeypair();
+
+    // ============================
+    // Register ke Server
+    // ============================
+
+    const result = await api(
+        "/api/register",
+        {
+            method: "POST",
+            body: JSON.stringify({
+
+                username,
+
+                display_name: form.get("display_name").trim(),
+
+                password,
+
+                public_key: dipp.public
+
+            }),
+        }
+    );
+
+    // ============================
+    // Simpan Session Login
+    // ============================
+
+    state.token = result.token;
+
+    state.username = result.username;
+
+    localStorage.setItem(
+        "om_token",
+        state.token
+    );
+
+    localStorage.setItem(
+        "om_username",
+        state.username
+    );
+
+    // ============================
+    // Simpan DIPP ke RAM
+    // ============================
+
+    dippSession.privateKey = dipp;
+
+    dippSession.publicKey = dipp.public;
+
+    dippSession.username = username;
+
+    state.unlockedPrivateKey = dipp;
+
+    state.keyUnlockedUntil =
+        Date.now() + SESSION_UNLOCK_MS;
+
+    armKeyLockTimer();
+
+    updateLocalKeyStatus();
+
+    renderAuth();
+
+    await refreshAll();
+
+    // ============================
+    // Export Identitas DIPP
+    // ============================
+
+    let exportSuccess = false;
+
+    try {
+
+        await exportDippIdentity(
+            username,
+            dipp
+        );
+
+        exportSuccess = true;
+
+    } catch (err) {
+
+        console.error(
+            "Export DIPP gagal:",
+            err
+        );
+
+    }
+
+    // ============================
+    // Notifikasi
+    // ============================
+
+    if (exportSuccess) {
+
+        showNotice(
+            "Registrasi berhasil.\n\nIdentitas DIPP telah berhasil diunduh.\nSimpan file tersebut dengan aman karena diperlukan untuk membuka file di kemudian hari."
+        );
+
+    } else {
+
+        showNotice(
+            "Registrasi berhasil.\n\nNamun Identitas DIPP GAGAL diunduh.\n\nJANGAN tutup browser ini.\nPrivate Key masih tersimpan di RAM.\nSilakan lakukan Export Identitas DIPP kembali sebelum keluar dari aplikasi."
+        );
+
+    }
+
+});
+
+on("importDippInput", "change", async (evt) => {
+
+    const file = evt.currentTarget.files[0];
+
+    if (!file || !state.username) {
+        return;
+    }
+
+    try {
+
+        await importDippIdentity(
+            file,
+            state.username
+        );
+
+        showNotice(
+            "Identitas DIPP berhasil dimuat."
+        );
+
+    }
+
+    catch (err) {
+
+        console.error(err);
+
+        showNotice(err.message);
+
+    }
+
+    finally {
+
+        evt.currentTarget.value = "";
+
+    }
+
+});
+
+on("importDippInput", "change", async (evt) => {
+
+    const file = evt.currentTarget.files[0];
+
+    if (!file) return;
+
+    try {
+
+        await importDippIdentity(
+            file,
+            state.username
+        );
+
+        updateLocalKeyStatus();
+
+        showNotice(
+            "Identitas DIPP berhasil diimport."
+        );
+
+    }
+
+    catch (err) {
+
+        showNotice(err.message);
+
+    }
+
+    finally {
+
+        evt.currentTarget.value = "";
+
+    }
+
 });
 
 on("loginForm", "submit", async (evt) => {
+
   evt.preventDefault();
+
   const form = new FormData(evt.currentTarget);
+
   const username = form.get("username").trim();
+
   const password = form.get("password");
-  const result = await api("/api/login", {method: "POST", body: JSON.stringify({username, password})});
-  state.token = result.token;
-  state.username = result.username;
-  localStorage.setItem("om_token", state.token);
-  localStorage.setItem("om_username", state.username);
-  localStorage.removeItem("om_last_password_hint");
-  renderAuth();
-  await refreshAll();
-  try {
-    await unlockPrivateKeySession(password);
-    showNotice("Login berhasil. Private key unlocked sementara di memory tab ini.");
-  } catch {
-    updateLocalKeyStatus();
-    showNotice("Login berhasil, tetapi kunci lokal belum tersedia. Import encrypted private key sebelum membuka file lama.");
+
+  // ============================
+  // Pastikan file DIPP dipilih
+  // ============================
+
+  if (!selectedDippFile) {
+
+    showNotice(
+      "Silakan pilih file Identitas DIPP terlebih dahulu."
+    );
+
+    return;
+
   }
+
+  // ============================
+  // Login ke Server
+  // ============================
+
+  const result = await api(
+    "/api/login",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        username,
+        password
+      })
+    }
+  );
+
+  state.token = result.token;
+
+  state.username = result.username;
+
+  localStorage.setItem(
+    "om_token",
+    state.token
+  );
+
+  localStorage.setItem(
+    "om_username",
+    state.username
+  );
+
+  localStorage.removeItem(
+    "om_last_password_hint"
+  );
+
+  // ============================
+  // Import Identitas DIPP
+  // ============================
+
+  await importDippIdentity(
+    selectedDippFile,
+    username
+  );
+
+  // ============================
+  // Unlock ke RAM
+  // ============================
+
+  await unlockPrivateKeySession();
+
+  renderAuth();
+
+  await refreshAll();
+
+  updateLocalKeyStatus();
+
+  showNotice(
+    "Login berhasil."
+  );
+
 });
 
 on("uploadForm", "submit", async (evt) => {
@@ -1163,6 +1483,12 @@ on("uploadForm", "submit", async (evt) => {
     const form = evt.currentTarget;
 
     try {
+
+        // =====================================
+        // WAJIB IMPORT IDENTITAS DIPP DAHULU
+        // =====================================
+
+        await ensureUnlockedPrivateKey();
 
         const file = new FormData(form).get("file");
 
@@ -1207,7 +1533,7 @@ on("uploadForm", "submit", async (evt) => {
 
         console.error(err);
 
-        alert(err.stack || err.message);
+        alert(err.message || err);
 
     }
     finally {
@@ -1325,38 +1651,84 @@ on("updateFileInput", "change", async (evt) => {
     evt.currentTarget.value = "";
   }
 });
-on("exportKeyBtn", "click", exportPrivateKeyBackup);
-on("unlockKeyBtn", "click", async () => {
-  const password = prompt("Masukkan password akun untuk unlock private key session:");
-  if (!password) return;
-  await unlockPrivateKeySession(password);
-  showNotice("Private key unlocked di memory tab ini. Tidak disimpan sebagai plaintext.");
-});
-on("lockKeyBtn", "click", () => lockPrivateKeySession("Private key session dikunci."));
-on("importKeyInput", "change", async (evt) => {
-  const file = evt.currentTarget.files[0];
-  try {
-    await importPrivateKeyBackup(file);
-  } finally {
-    evt.currentTarget.value = "";
-  }
+
+on("exportDippBtn", "click", async () => {
+
+    if (!state.username) {
+
+        showNotice(
+            "Silakan login terlebih dahulu."
+        );
+
+        return;
+
+    }
+
+    if (!dippSession.privateKey) {
+
+        showNotice(
+            "Identitas DIPP belum tersedia di RAM."
+        );
+
+        return;
+
+    }
+
+    try {
+
+        await exportDippIdentity(
+
+            state.username,
+
+            dippSession.privateKey
+
+        );
+
+        showNotice(
+            "Identitas DIPP berhasil diexport."
+        );
+
+    }
+
+    catch (err) {
+
+        console.error(err);
+
+        showNotice(
+            "Export Identitas DIPP gagal."
+        );
+
+    }
+
 });
 on("logoutBtn", "click", () => {
+
+  // Hapus private key DIPP dari RAM
+  dippSession.privateKey = null;
+  dippSession.publicKey = null;
+  dippSession.username = null;
+
+  // Lock session key
   lockPrivateKeySession("");
+
+  // Hapus session login
   localStorage.removeItem("om_token");
   localStorage.removeItem("om_username");
   localStorage.removeItem("om_last_password_hint");
+
   state.token = null;
   state.username = null;
+  state.unlockedPrivateKey = null;
+
   renderAuth();
-});
-on("forgetLocalBtn", "click", () => {
-  lockPrivateKeySession("");
-  if (state.username) localStorage.removeItem(`om_private_${state.username}`);
-  updateLocalKeyStatus();
-  showNotice("Kunci lokal akun ini dihapus dari browser.");
+
 });
 
 window.addEventListener("unhandledrejection", evt => showNotice(evt.reason?.message || "Terjadi kesalahan."));
 renderAuth();
 refreshAll();
+on("dippFile", "change", (evt) => {
+
+    selectedDippFile = evt.target.files[0] || null;
+
+});

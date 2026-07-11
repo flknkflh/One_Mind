@@ -20,66 +20,180 @@
     </section>
 
     <section id="authView" class="grid two">
+
+      <!-- ================= REGISTER ================= -->
+
       <form id="registerForm" class="panel">
+
         <h2>Daftar</h2>
+
         <div class="warningBox">
-          <strong>Kunci dekripsi dibuat di browser ini.</strong>
-          <p>Simpan password dengan aman dan jangan hapus data browser sebelum kunci lokal dicadangkan. Server tidak menyimpan private key untuk membuka file.</p>
+
+          <strong>
+            Identitas DIPP akan dibuat dan diunduh ke komputer Anda.
+          </strong>
+
+          <p>
+            Server <b>tidak pernah menyimpan Private Key DIPP</b>.
+            Setelah registrasi selesai, browser akan otomatis mengunduh
+            file <b>Identitas DIPP (.dipp)</b>.
+            Simpan file tersebut di tempat yang aman karena diperlukan
+            untuk membuka file yang Anda miliki di kemudian hari.
+          </p>
+
         </div>
-        <label>Username<input name="username" autocomplete="username" required minlength="3"></label>
-        <label>Nama tampilan<input name="display_name" required></label>
-        <label>Password<input name="password" type="password" autocomplete="new-password" required minlength="8"></label>
-        <button type="submit">Buat akun dan keypair</button>
+
+        <label>
+          Username
+          <input
+            name="username"
+            autocomplete="username"
+            required
+            minlength="3">
+        </label>
+
+        <label>
+          Nama Tampilan
+          <input
+            name="display_name"
+            required>
+        </label>
+
+        <label>
+          Password
+          <input
+            name="password"
+            type="password"
+            autocomplete="new-password"
+            required
+            minlength="8">
+        </label>
+
+        <button type="submit">
+
+          Buat Akun & Unduh Identitas DIPP
+
+        </button>
+
       </form>
+
+      <!-- ================= LOGIN ================= -->
 
       <form id="loginForm" class="panel">
-        <h2>Login</h2>
-        <label>Username<input name="username" autocomplete="username" required></label>
-        <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
-        <button type="submit">Login</button>
-      </form>
-    </section>
 
-    <section id="appView" class="hidden">
+        <h2>Login</h2>
+
+        <label>
+
+          Username
+
+          <input
+            name="username"
+            autocomplete="username"
+            required>
+
+        </label>
+
+        <label>
+
+          Password
+
+          <input
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            required>
+
+        </label>
+
+        <label>
+
+          Identitas DIPP
+
+          <input
+            id="dippFile"
+            name="dipp"
+            type="file"
+            accept=".dipp"
+            required>
+
+        </label>
+
+        <button type="submit">
+
+          Login
+
+        </button>
+
+      </form>
+
+    </section>
+        <section id="appView" class="hidden">
       <div class="appChrome">
+
         <aside class="sidebar">
+
           <nav class="tabs">
-            <button data-tab="files" class="active">File Saya</button>
-            <button data-tab="upload">Upload Terenkripsi</button>
-            <button data-tab="share">Bagikan Kunci</button>
-            <button data-tab="users">Direktori User</button>
-            <button data-tab="keys">Kunci Lokal</button>
+
+            <button data-tab="files" class="active">
+              File Saya
+            </button>
+
+            <button data-tab="upload">
+              Upload Terenkripsi
+            </button>
+
+            <button data-tab="share">
+              Bagikan Kunci
+            </button>
+
+            <button data-tab="users">
+              Direktori User
+            </button>
+
+            <button data-tab="identity">
+              Identitas DIPP
+            </button>
+
           </nav>
+
           <div class="statusCard">
             <span>Transport</span>
             <strong>HTTPS/TLS aktif</strong>
           </div>
+
           <div class="statusCard">
             <span>Model keamanan</span>
             <strong>Zero-knowledge file</strong>
           </div>
+
         </aside>
 
         <div class="workspace">
+
           <section class="metrics">
+
             <div>
               <span>Total akses</span>
               <strong id="totalFiles">0</strong>
             </div>
+
             <div>
               <span>Milik saya</span>
               <strong id="ownedFiles">0</strong>
             </div>
+
             <div>
               <span>Dibagikan</span>
               <strong id="sharedFiles">0</strong>
             </div>
+
             <div>
               <span>User lain</span>
               <strong id="userCount">0</strong>
             </div>
-          </section>
 
+          </section>
           <section id="filesTab" class="tab">
             <div class="panel">
               <div class="panelHead">
@@ -164,34 +278,65 @@
             </div>
           </section>
 
-          <section id="keysTab" class="tab hidden">
+          <section id="identityTab" class="tab hidden">
+
             <div class="panel">
-              <h2>Kunci lokal browser</h2>
-              <p id="localKeyStatus" class="keyStatus">Memeriksa kunci lokal...</p>
+
+              <h2>Identitas DIPP</h2>
+
+              <p id="localKeyStatus" class="keyStatus"></p>
+
               <div class="warningBox">
-                <strong>Backup file server tidak sama dengan backup kunci user.</strong>
-                <p>Private key DIPP akun ini disimpan di localStorage browser dalam bentuk terenkripsi memakai password akun. Jika data browser, profil browser, atau perangkat hilang, file lama tidak bisa didekripsi dari server saja.</p>
+
+                <strong>
+                  Private Key DIPP tidak pernah disimpan di server.
+                </strong>
+
+                <p>
+                  Private Key DIPP tidak pernah disimpan di browser.
+                  Private Key hanya berada pada:
+                </p>
+
+                <ul>
+                  <li>File .dipp</li>
+                  <li>RAM browser selama login</li>
+                </ul>
+
+                <p>
+                  Kehilangan file .dipp dapat menyebabkan file terenkripsi
+                  milik pengguna tidak dapat dibuka kembali.
+                </p>
+
               </div>
+
               <div class="safeSteps">
-                <h3>Tata cara aman sebelum pindah perangkat</h3>
+
+                <h3>Praktik yang Direkomendasikan</h3>
+
                 <ol>
-                  <li>Pastikan masih bisa login dan mengunduh file dari browser lama.</li>
-                  <li>Jangan hapus cache, localStorage, profil browser, atau instal ulang sistem sebelum semua file penting berhasil dibuka di perangkat baru.</li>
-                  <li>Simpan password akun di password manager atau catatan offline yang aman.</li>
-                  <li>Untuk migrasi server, backup volume <code>one_mind_data</code>. Untuk pindah perangkat, export encrypted private key lalu simpan file backup dan password backup secara terpisah.</li>
+                  <li>Simpan file DIPP.</li>
+                  <li>Backup ke media offline.</li>
+                  <li>Jangan membagikan file DIPP.</li>
+                  <li>Jika berpindah komputer cukup login lalu import file DIPP kembali.</li>
                 </ol>
+
               </div>
+
               <div class="keyActions">
-                <button id="unlockKeyBtn" type="button">Unlock private key session</button>
-                <button id="lockKeyBtn" class="ghost hidden" type="button">Lock session sekarang</button>
-                <button id="exportKeyBtn" type="button">Export encrypted private key</button>
+
+                <button id="exportDippBtn" type="button">
+                  Export Identitas DIPP
+                </button>
+
                 <label class="importKeyControl">
-                  Import encrypted private key
-                  <input id="importKeyInput" type="file" accept=".one-mind-key,.json,application/json">
+                  Import Identitas DIPP
+                  <input id="importDippInput" type="file" accept=".dipp">
                 </label>
+
               </div>
-              <button id="forgetLocalBtn" class="danger">Hapus kunci lokal perangkat ini</button>
+
             </div>
+
           </section>
         </div>
       </div>
