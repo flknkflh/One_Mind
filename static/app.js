@@ -1,6 +1,12 @@
 const state = {
   token: localStorage.getItem("om_token"),
   username: localStorage.getItem("om_username"),
+  adminToken: localStorage.getItem("om_admin_token"),
+  adminUsername: localStorage.getItem("om_admin_username"),
+  adminSetupRequired: null,
+  adminUsers: [],
+  adminAccountGroups: {},
+  adminCertificateGroups: {},
   files: [],
   users: [],
   pendingUpdateFileId: null,
@@ -261,6 +267,54 @@ async function api(path, options = {}) {
             )
         );
 
+    }
+
+    return data;
+
+}
+
+async function adminApi(path, options = {}) {
+
+    const headers = {
+        "Content-Type": "application/json",
+        ...(options.headers || {})
+    };
+
+    if (state.adminToken) {
+        headers.Authorization = `Bearer ${state.adminToken}`;
+    }
+
+    const res = await fetch(
+        path,
+        {
+            ...options,
+            headers
+        }
+    );
+
+    const data = await res.json().catch(() => ({}));
+
+    console.log("ADMIN API:", path);
+    console.log(data);
+
+    if (!res.ok) {
+
+        if (res.status === 401 && state.adminToken) {
+            clearAdminSession();
+            renderAuth();
+            refreshAdminSetupStatus();
+        }
+
+        throw new Error(
+            "HTTP " +
+            res.status +
+            "\n\n" +
+            JSON.stringify(
+                data,
+                null,
+                2
+            )
+        );
     }
 
     return data;
@@ -1367,20 +1421,27 @@ async function rotateCurrentFileKey(fileId) {
 function renderAuth() {
 
     const loggedIn = Boolean(state.token);
+    const adminLoggedIn = Boolean(state.adminToken);
 
-    $("authView")?.classList.toggle("hidden", loggedIn);
+    $("authView")?.classList.toggle("hidden", loggedIn || adminLoggedIn);
 
-    $("appView")?.classList.toggle("hidden", !loggedIn);
+    $("appView")?.classList.toggle("hidden", !loggedIn || adminLoggedIn);
 
-    $("logoutBtn")?.classList.toggle("hidden", !loggedIn);
+    $("adminView")?.classList.toggle("hidden", !adminLoggedIn);
+
+    $("logoutBtn")?.classList.toggle("hidden", !loggedIn || adminLoggedIn);
+
+    $("adminLogoutBtn")?.classList.toggle("hidden", !adminLoggedIn);
 
     if ($("sessionText")) {
-        $("sessionText").textContent = loggedIn
+        $("sessionText").textContent = adminLoggedIn
+            ? `Admin: ${state.adminUsername}`
+            : loggedIn
             ? `Login sebagai ${state.username}`
             : "Belum login";
     }
 
-    if (loggedIn) {
+    if (loggedIn && !adminLoggedIn) {
 
         // Sembunyikan semua tab
         document.querySelectorAll(".tab").forEach(tab => {
@@ -1412,6 +1473,254 @@ function resetAuthInputs() {
     $("loginForm")?.reset();
 
     selectedDippFile = null;
+
+}
+
+function resetAdminInputs() {
+
+    $("adminSetupForm")?.reset();
+
+    $("adminLoginForm")?.reset();
+
+    $("adminPasswordForm")?.reset();
+
+}
+
+function clearAdminSession() {
+
+    localStorage.removeItem("om_admin_token");
+
+    localStorage.removeItem("om_admin_username");
+
+    state.adminToken = null;
+
+    state.adminUsername = null;
+
+    state.adminUsers = [];
+
+    state.adminAccountGroups = {};
+
+    state.adminCertificateGroups = {};
+
+}
+
+function renderAdminAuth() {
+
+    const setupBox = $("adminSetupBox");
+
+    const loginForm = $("adminLoginForm");
+
+    if (!setupBox || !loginForm)
+        return;
+
+    setupBox.classList.toggle(
+        "hidden",
+        state.adminSetupRequired !== true
+    );
+
+    loginForm.classList.toggle(
+        "hidden",
+        state.adminSetupRequired !== false
+    );
+
+}
+
+async function refreshAdminSetupStatus() {
+
+    if (state.adminToken) {
+        return;
+    }
+
+    const status = await adminApi(
+        "/api/admin/setup-status"
+    );
+
+    state.adminSetupRequired =
+        Boolean(status.setup_required);
+
+    renderAdminAuth();
+
+}
+
+function adminUserActions(user) {
+
+    const username =
+        escapeHtml(user.username);
+
+    if (user.account_status === "DELETED") {
+        return [
+            `<button class="ghost" data-admin-action="restore" data-admin-user="${username}">Restore</button>`
+        ].join("");
+    }
+
+    return [
+        `<button class="ghost" data-admin-edit="${username}">Edit</button>`,
+        user.account_status === "PENDING"
+            ? `<button data-admin-action="approve" data-admin-user="${username}">Approve</button>`
+            : "",
+        user.account_status === "PENDING"
+            ? `<button class="ghost" data-admin-action="reject" data-admin-user="${username}">Reject</button>`
+            : "",
+        user.account_status === "ACTIVE"
+            ? `<button class="ghost" data-admin-action="revoke" data-admin-user="${username}">Revoke</button>`
+            : "",
+        user.account_status === "REJECTED"
+            ? `<button class="ghost" data-admin-action="restore" data-admin-user="${username}">Restore</button>`
+            : "",
+        user.account_status !== "DELETED"
+            ? `<button class="danger" data-admin-action="soft-delete" data-admin-user="${username}">Soft Delete</button>`
+            : ""
+    ].join("");
+
+}
+
+function renderAdminUser(user) {
+
+    const row =
+        document.createElement("div");
+
+    row.className =
+        "item adminUserItem";
+
+    row.innerHTML = `
+        <div>
+            <strong>${escapeHtml(user.display_name)} (${escapeHtml(user.username)})</strong>
+            <div class="adminUserMeta">
+                <span>NIP: ${escapeHtml(user.nip || "-")}</span>
+                <span>Pangkat: ${escapeHtml(user.rank || "-")}</span>
+                <span>Jabatan: ${escapeHtml(user.position || "-")}</span>
+                <span>Akun: <b>${escapeHtml(user.account_status)}</b></span>
+                <span>Certificate: <b>${escapeHtml(user.certificate_status)}</b></span>
+                <span>DIPP: ${user.has_dipp_public_key ? "Public key ada" : "Belum ada"}</span>
+                <span>PKI: ${user.has_pki_public_key ? "Public key ada" : "Belum ada"}</span>
+            </div>
+        </div>
+        <div class="itemActions">
+            ${adminUserActions(user)}
+        </div>
+    `;
+
+    return row;
+
+}
+
+function renderAdminDashboard() {
+
+    const accountRoot =
+        $("adminAccountGroups");
+
+    const certificateRoot =
+        $("adminCertificateGroups");
+
+    if (!accountRoot || !certificateRoot)
+        return;
+
+    const pending =
+        state.adminAccountGroups.PENDING || [];
+
+    const active =
+        state.adminAccountGroups.ACTIVE || [];
+
+    const rejected =
+        state.adminAccountGroups.REJECTED || [];
+
+    const deleted =
+        state.adminAccountGroups.DELETED || [];
+
+    if ($("adminPendingCount"))
+        $("adminPendingCount").textContent = String(pending.length);
+
+    if ($("adminActiveCount"))
+        $("adminActiveCount").textContent = String(active.length);
+
+    if ($("adminRejectedCount"))
+        $("adminRejectedCount").textContent = String(rejected.length);
+
+    if ($("adminDeletedCount"))
+        $("adminDeletedCount").textContent = String(deleted.length);
+
+    accountRoot.innerHTML = "";
+
+    for (const status of ["PENDING", "ACTIVE", "REJECTED", "DELETED"]) {
+
+        const group =
+            state.adminAccountGroups[status] || [];
+
+        const section =
+            document.createElement("section");
+
+        section.className =
+            "lifecycleSection";
+
+        section.innerHTML = `
+            <div class="lifecycleHead">
+                <h3>${status}</h3>
+                <span class="statusBadge">${group.length}</span>
+            </div>
+            <div class="list"></div>
+        `;
+
+        const list =
+            section.querySelector(".list");
+
+        if (!group.length) {
+            list.innerHTML =
+                `<div class="emptyState"><strong>Tidak ada user ${status}</strong></div>`;
+        } else {
+            for (const user of group) {
+                list.appendChild(
+                    renderAdminUser(user)
+                );
+            }
+        }
+
+        accountRoot.appendChild(section);
+
+    }
+
+    certificateRoot.innerHTML = "";
+
+    for (const status of ["NONE", "ISSUED", "REVOKED", "EXPIRED", "REPLACED"]) {
+
+        const group =
+            state.adminCertificateGroups[status] || [];
+
+        const item =
+            document.createElement("div");
+
+        item.className =
+            "statusCard";
+
+        item.innerHTML = `
+            <span>${status}</span>
+            <strong>${group.length}</strong>
+        `;
+
+        certificateRoot.appendChild(item);
+
+    }
+
+}
+
+async function refreshAdminDashboard() {
+
+    if (!state.adminToken) {
+        return;
+    }
+
+    const data =
+        await adminApi("/api/admin/users");
+
+    state.adminUsers =
+        data.users || [];
+
+    state.adminAccountGroups =
+        data.account_groups || {};
+
+    state.adminCertificateGroups =
+        data.certificate_groups || {};
+
+    renderAdminDashboard();
 
 }
 
@@ -1641,6 +1950,249 @@ document.querySelectorAll(".tabs button").forEach(btn => {
   });
 });
 
+on("adminSetupForm", "submit", async (evt) => {
+
+    evt.preventDefault();
+
+    const form =
+        new FormData(evt.currentTarget);
+
+    const result =
+        await adminApi(
+            "/api/admin/setup",
+            {
+                method: "POST",
+                body: JSON.stringify({
+                    username: form.get("username").trim(),
+                    password: form.get("password")
+                })
+            }
+        );
+
+    state.adminToken =
+        result.token;
+
+    state.adminUsername =
+        result.username;
+
+    state.adminSetupRequired =
+        false;
+
+    localStorage.setItem(
+        "om_admin_token",
+        state.adminToken
+    );
+
+    localStorage.setItem(
+        "om_admin_username",
+        state.adminUsername
+    );
+
+    resetAdminInputs();
+
+    renderAuth();
+
+    await refreshAdminDashboard();
+
+    showNotice("Administrator berhasil diinisialisasi.");
+
+});
+
+on("adminLoginForm", "submit", async (evt) => {
+
+    evt.preventDefault();
+
+    const form =
+        new FormData(evt.currentTarget);
+
+    const result =
+        await adminApi(
+            "/api/admin/login",
+            {
+                method: "POST",
+                body: JSON.stringify({
+                    username: form.get("username").trim(),
+                    password: form.get("password")
+                })
+            }
+        );
+
+    state.adminToken =
+        result.token;
+
+    state.adminUsername =
+        result.username;
+
+    localStorage.setItem(
+        "om_admin_token",
+        state.adminToken
+    );
+
+    localStorage.setItem(
+        "om_admin_username",
+        state.adminUsername
+    );
+
+    resetAdminInputs();
+
+    renderAuth();
+
+    await refreshAdminDashboard();
+
+    showNotice("Login administrator berhasil.");
+
+});
+
+on("adminLogoutBtn", "click", () => {
+
+    clearAdminSession();
+
+    resetAdminInputs();
+
+    renderAuth();
+
+    refreshAdminSetupStatus();
+
+});
+
+on("refreshAdminBtn", "click", refreshAdminDashboard);
+
+on("adminPasswordForm", "submit", async (evt) => {
+
+    evt.preventDefault();
+
+    const form =
+        new FormData(evt.currentTarget);
+
+    await adminApi(
+        "/api/admin/change-password",
+        {
+            method: "POST",
+            body: JSON.stringify({
+                current_password: form.get("current_password"),
+                new_password: form.get("new_password")
+            })
+        }
+    );
+
+    evt.currentTarget.reset();
+
+    showNotice("Password admin berhasil diubah.");
+
+});
+
+on("adminAccountGroups", "click", async (evt) => {
+
+    const editButton =
+        evt.target.closest("[data-admin-edit]");
+
+    if (editButton) {
+
+        const username =
+            editButton.dataset.adminEdit;
+
+        const user =
+            state.adminUsers.find(item => item.username === username);
+
+        if (!user) {
+            return;
+        }
+
+        const displayName =
+            prompt("Nama lengkap:", user.display_name || "");
+
+        if (displayName === null)
+            return;
+
+        const nip =
+            prompt("NIP:", user.nip || "");
+
+        if (nip === null)
+            return;
+
+        const rank =
+            prompt("Pangkat:", user.rank || "");
+
+        if (rank === null)
+            return;
+
+        const position =
+            prompt("Jabatan:", user.position || "");
+
+        if (position === null)
+            return;
+
+        await adminApi(
+            `/api/admin/users/${encodeURIComponent(username)}`,
+            {
+                method: "PATCH",
+                body: JSON.stringify({
+                    display_name: displayName.trim(),
+                    nip: nip.trim(),
+                    rank: rank.trim(),
+                    position: position.trim()
+                })
+            }
+        );
+
+        await refreshAdminDashboard();
+
+        showNotice("Metadata user berhasil diperbarui.");
+
+        return;
+
+    }
+
+    const actionButton =
+        evt.target.closest("[data-admin-action]");
+
+    if (!actionButton) {
+        return;
+    }
+
+    const username =
+        actionButton.dataset.adminUser;
+
+    const action =
+        actionButton.dataset.adminAction;
+
+    let body = {};
+
+    if (action === "reject" || action === "revoke") {
+
+        const reason =
+            prompt("Alasan tindakan:", "");
+
+        if (reason === null)
+            return;
+
+        body.reason =
+            reason.trim();
+
+    }
+
+    if (action === "soft-delete") {
+
+        if (!confirm(`Soft delete user ${username}?`)) {
+            return;
+        }
+
+    }
+
+    await adminApi(
+        `/api/admin/users/${encodeURIComponent(username)}/${action}`,
+        {
+            method: "POST",
+            body: JSON.stringify(body)
+        }
+    );
+
+    await refreshAdminDashboard();
+
+    showNotice(`Aksi ${action} berhasil dijalankan untuk ${username}.`);
+
+});
+
 on("registerForm", "submit", async (evt) => {
 
     evt.preventDefault();
@@ -1702,24 +2254,6 @@ on("registerForm", "submit", async (evt) => {
     );
 
     // ============================
-    // Simpan Session Login
-    // ============================
-
-    state.token = result.token;
-
-    state.username = result.username;
-
-    localStorage.setItem(
-        "om_token",
-        state.token
-    );
-
-    localStorage.setItem(
-        "om_username",
-        state.username
-    );
-
-    // ============================
     // Simpan DIPP ke RAM
     // ============================
 
@@ -1736,12 +2270,6 @@ on("registerForm", "submit", async (evt) => {
     // ============================
 
     pkiSession.username = username;
-
-    updateLocalKeyStatus();
-
-    renderAuth();
-
-    await refreshAll();
 
     // ============================
     // Export Identitas DIPP
@@ -1774,16 +2302,20 @@ on("registerForm", "submit", async (evt) => {
     if (exportSuccess) {
 
         showNotice(
-            "Registrasi berhasil.\n\nIdentitas DIPP telah berhasil diunduh.\nSimpan file tersebut dengan aman karena diperlukan untuk membuka file di kemudian hari."
+            "Registrasi berhasil.\n\nIdentitas DIPP telah berhasil diunduh.\nSimpan file tersebut dengan aman.\n\nAkun masih PENDING dan menunggu approval administrator sebelum bisa login."
         );
 
     } else {
 
         showNotice(
-            "Registrasi berhasil.\n\nNamun Identitas DIPP GAGAL diunduh.\n\nJANGAN tutup browser ini.\nPrivate Key masih tersimpan di RAM.\nSilakan lakukan Export Identitas DIPP kembali sebelum keluar dari aplikasi."
+            "Registrasi berhasil.\n\nNamun Identitas DIPP GAGAL diunduh.\n\nAkun masih PENDING dan menunggu approval administrator. JANGAN tutup browser ini jika perlu mencoba export ulang."
         );
 
     }
+
+    evt.currentTarget.reset();
+
+    renderAuth();
 
 });
 
@@ -2200,6 +2732,8 @@ on("logoutBtn", "click", () => {
 window.addEventListener("unhandledrejection", evt => showNotice(evt.reason?.message || "Terjadi kesalahan."));
 renderAuth();
 refreshAll();
+refreshAdminSetupStatus();
+refreshAdminDashboard();
 on("dippFile", "change", (evt) => {
 
     selectedDippFile = evt.target.files[0] || null;

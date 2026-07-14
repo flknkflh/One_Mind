@@ -38,10 +38,13 @@ SECRET_PATH = DATA_DIR / "keys" / "server_secret.bin"
 
 PBKDF2_ITERATIONS = 390_000
 SESSION_SECONDS = int(os.environ.get("ONE_MIND_SESSION_SECONDS", "43200"))
+ADMIN_SESSION_SECONDS = int(os.environ.get("ONE_MIND_ADMIN_SESSION_SECONDS", "43200"))
 LOGIN_WINDOW_SECONDS = int(os.environ.get("ONE_MIND_LOGIN_WINDOW_SECONDS", "600"))
 LOGIN_MAX_FAILURES = int(os.environ.get("ONE_MIND_LOGIN_MAX_FAILURES", "8"))
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get("ONE_MIND_ALLOWED_HOSTS", "*").split(",") if h.strip()]
 FAILED_LOGINS: dict[str, list[float]] = {}
+ACCOUNT_STATUSES = ("PENDING", "ACTIVE", "REJECTED", "DELETED")
+CERTIFICATE_STATUSES = ("NONE", "ISSUED", "REVOKED", "EXPIRED", "REPLACED")
 
 
 def now_iso() -> str:
@@ -190,6 +193,37 @@ def verify_token(token: str) -> str:
         raise
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Token sesi tidak valid.") from exc
+
+
+def sign_admin_token(username: str) -> str:
+    nonce = new_id(24)
+    payload = {
+        "type": "admin",
+        "username": username,
+        "nonce": nonce,
+        "exp": int(time.time()) + ADMIN_SESSION_SECONDS,
+    }
+    raw = b64e(json.dumps(payload, sort_keys=True).encode("utf-8"))
+    sig = hmac.new(get_secret(), raw.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{raw}.{sig}"
+
+
+def verify_admin_token(token: str) -> str:
+    try:
+        raw, sig = token.split(".", 1)
+        expected = hmac.new(get_secret(), raw.encode("ascii"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            raise ValueError
+        payload = json.loads(b64d(raw).decode("utf-8"))
+        if payload.get("type") != "admin":
+            raise ValueError
+        if int(payload.get("exp", 0)) < int(time.time()):
+            raise HTTPException(status_code=401, detail="Sesi admin sudah kedaluwarsa. Silakan login ulang.")
+        return payload["username"]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Token admin tidak valid.") from exc
 
 
 def login_bucket(request: Request, username: str) -> str:
@@ -381,6 +415,22 @@ def db() -> sqlite3.Connection:
             revoked_by TEXT NOT NULL,
             reason TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS administrators (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS admin_audit_log (
+            id TEXT PRIMARY KEY,
+            admin_username TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target_username TEXT,
+            detail TEXT,
+            created_at TEXT NOT NULL
+        );
         """
     )
 
@@ -507,7 +557,128 @@ def db() -> sqlite3.Connection:
 def current_user(authorization: str | None = Header(default=None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Login diperlukan.")
-    return verify_token(authorization.removeprefix("Bearer ").strip())
+    username = verify_token(authorization.removeprefix("Bearer ").strip())
+
+    conn = db()
+    row = conn.execute(
+        """
+        SELECT account_status
+        FROM users
+        WHERE username=?
+        """,
+        (
+            username,
+        ),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=401, detail="Akun tidak ditemukan.")
+
+    enforce_active_account(row["account_status"])
+
+    return username
+
+
+def account_status_detail(account_status: str) -> str:
+    if account_status == "PENDING":
+        return "Akun sedang menunggu approval administrator."
+    if account_status == "REJECTED":
+        return "Akun sudah ditolak atau dicabut oleh administrator."
+    if account_status == "DELETED":
+        return "Akun sudah dihapus oleh administrator."
+    return "Status akun tidak aktif."
+
+
+def enforce_active_account(account_status: str) -> None:
+    if account_status != "ACTIVE":
+        raise HTTPException(
+            status_code=403,
+            detail=account_status_detail(account_status),
+        )
+
+
+def current_admin(authorization: str | None = Header(default=None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Login admin diperlukan.")
+    admin_username = verify_admin_token(authorization.removeprefix("Bearer ").strip())
+
+    conn = db()
+    exists = conn.execute(
+        """
+        SELECT 1
+        FROM administrators
+        WHERE username=?
+        """,
+        (
+            admin_username,
+        ),
+    ).fetchone()
+    conn.close()
+
+    if not exists:
+        raise HTTPException(status_code=401, detail="Session admin tidak lagi valid.")
+
+    return admin_username
+
+
+def admin_count(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COUNT(*) AS total FROM administrators").fetchone()
+    return int(row["total"])
+
+
+def user_admin_view(row: sqlite3.Row) -> dict:
+    return {
+        "username": row["username"],
+        "display_name": row["display_name"],
+        "nip": row["nip"],
+        "rank": row["rank"],
+        "position": row["position"],
+        "account_status": row["account_status"],
+        "certificate_status": row["certificate_status"],
+        "created_at": row["created_at"],
+        "approved_at": row["approved_at"],
+        "approved_by": row["approved_by"],
+        "revoked_at": row["revoked_at"],
+        "revoked_by": row["revoked_by"],
+        "deleted_at": row["deleted_at"],
+        "deleted_by": row["deleted_by"],
+        "has_dipp_public_key": bool(row["public_key"]),
+        "has_pki_public_key": bool(row["pki_public_key"]),
+    }
+
+
+def record_admin_audit(
+    conn: sqlite3.Connection,
+    admin_username: str,
+    action: str,
+    target_username: str | None = None,
+    detail: dict | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO admin_audit_log
+        (
+            id,
+            admin_username,
+            action,
+            target_username,
+            detail,
+            created_at
+        )
+        VALUES
+        (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            new_id(),
+            admin_username,
+            action,
+            target_username,
+            json.dumps(detail or {}, ensure_ascii=False, separators=(",", ":")),
+            now_iso(),
+        ),
+    )
+
 
 class RegisterIn(BaseModel):
 
@@ -525,6 +696,32 @@ class RegisterIn(BaseModel):
 class LoginIn(BaseModel):
     username: str
     password: str
+
+
+class AdminSetupIn(BaseModel):
+    username: str = Field(min_length=3, max_length=80)
+    password: str = Field(min_length=8)
+
+
+class AdminLoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class AdminPasswordChangeIn(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
+
+class AdminUserEditIn(BaseModel):
+    display_name: str = Field(min_length=1, max_length=160)
+    nip: str = Field(min_length=1, max_length=80)
+    rank: str = Field(min_length=1, max_length=80)
+    position: str = Field(min_length=1, max_length=160)
+
+
+class AdminUserReasonIn(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
 
 
 class FileUploadIn(BaseModel):
@@ -619,6 +816,535 @@ def health():
     return {"ok": True, "transport": "HTTPS/TLS when run via docker entrypoint"}
 
 
+@app.get("/api/admin/setup-status")
+def admin_setup_status():
+    conn = db()
+    total = admin_count(conn)
+    conn.close()
+    return {"setup_required": total == 0}
+
+
+@app.post("/api/admin/setup")
+def admin_setup(data: AdminSetupIn, request: Request):
+    conn = db()
+
+    try:
+        if admin_count(conn) > 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Administrator sudah diinisialisasi."
+            )
+
+        username = data.username.strip()
+
+        if not username:
+            raise HTTPException(status_code=400, detail="Username admin wajib diisi.")
+
+        conn.execute(
+            """
+            INSERT INTO administrators
+            (
+                username,
+                password_hash,
+                created_at
+            )
+            VALUES
+            (?, ?, ?)
+            """,
+            (
+                username,
+                hash_password(data.password),
+                now_iso(),
+            ),
+        )
+
+        record_admin_audit(
+            conn,
+            username,
+            "ADMIN_INITIALIZED",
+            detail={"username": username},
+        )
+
+        conn.commit()
+
+        clear_login_failures(
+            login_bucket(request, f"admin:{username}")
+        )
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    return {
+        "token": sign_admin_token(username),
+        "username": username,
+    }
+
+
+@app.post("/api/admin/login")
+def admin_login(data: AdminLoginIn, request: Request):
+    username = data.username.strip()
+
+    rate_key = check_login_rate(request, f"admin:{username}")
+
+    conn = db()
+    row = conn.execute(
+        """
+        SELECT username, password_hash
+        FROM administrators
+        WHERE username=?
+        """,
+        (
+            username,
+        ),
+    ).fetchone()
+    conn.close()
+
+    if not row or not verify_password(data.password, row["password_hash"]):
+        record_login_failure(rate_key)
+        raise HTTPException(status_code=401, detail="Username atau password admin salah.")
+
+    clear_login_failures(rate_key)
+
+    return {
+        "token": sign_admin_token(row["username"]),
+        "username": row["username"],
+    }
+
+
+@app.get("/api/admin/me")
+def admin_me(admin_username: str = Depends(current_admin)):
+    return {"username": admin_username}
+
+
+@app.post("/api/admin/change-password")
+def admin_change_password(
+    data: AdminPasswordChangeIn,
+    admin_username: str = Depends(current_admin),
+):
+    conn = db()
+
+    try:
+        row = conn.execute(
+            """
+            SELECT password_hash
+            FROM administrators
+            WHERE username=?
+            """,
+            (
+                admin_username,
+            ),
+        ).fetchone()
+
+        if not row or not verify_password(data.current_password, row["password_hash"]):
+            raise HTTPException(status_code=401, detail="Password admin saat ini salah.")
+
+        conn.execute(
+            """
+            UPDATE administrators
+            SET password_hash=?,
+                updated_at=?
+            WHERE username=?
+            """,
+            (
+                hash_password(data.new_password),
+                now_iso(),
+                admin_username,
+            ),
+        )
+
+        record_admin_audit(
+            conn,
+            admin_username,
+            "ADMIN_PASSWORD_CHANGED",
+        )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    return {"ok": True}
+
+
+@app.get("/api/admin/users")
+def admin_users(admin_username: str = Depends(current_admin)):
+    conn = db()
+
+    rows = conn.execute(
+        """
+        SELECT
+            username,
+            display_name,
+            nip,
+            rank,
+            position,
+            public_key,
+            pki_public_key,
+            account_status,
+            certificate_status,
+            created_at,
+            approved_at,
+            approved_by,
+            revoked_at,
+            revoked_by,
+            deleted_at,
+            deleted_by
+        FROM users
+        ORDER BY created_at DESC, username ASC
+        """
+    ).fetchall()
+
+    conn.close()
+
+    users_result = [
+        user_admin_view(row)
+        for row in rows
+    ]
+
+    account_groups = {
+        status: [
+            user for user in users_result
+            if user["account_status"] == status
+        ]
+        for status in ACCOUNT_STATUSES
+    }
+
+    certificate_groups = {
+        status: [
+            user for user in users_result
+            if user["certificate_status"] == status
+        ]
+        for status in CERTIFICATE_STATUSES
+    }
+
+    return {
+        "account_statuses": list(ACCOUNT_STATUSES),
+        "certificate_statuses": list(CERTIFICATE_STATUSES),
+        "users": users_result,
+        "account_groups": account_groups,
+        "certificate_groups": certificate_groups,
+    }
+
+
+@app.patch("/api/admin/users/{target_username}")
+def admin_edit_user(
+    target_username: str,
+    data: AdminUserEditIn,
+    admin_username: str = Depends(current_admin),
+):
+    conn = db()
+
+    try:
+        row = conn.execute(
+            "SELECT username FROM users WHERE username=?",
+            (target_username,),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="User tidak ditemukan.")
+
+        conn.execute(
+            """
+            UPDATE users
+            SET display_name=?,
+                nip=?,
+                rank=?,
+                position=?
+            WHERE username=?
+            """,
+            (
+                data.display_name.strip(),
+                data.nip.strip(),
+                data.rank.strip(),
+                data.position.strip(),
+                target_username,
+            ),
+        )
+
+        record_admin_audit(
+            conn,
+            admin_username,
+            "USER_METADATA_EDITED",
+            target_username,
+            {
+                "display_name": data.display_name.strip(),
+                "nip": data.nip.strip(),
+                "rank": data.rank.strip(),
+                "position": data.position.strip(),
+            },
+        )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    return {"ok": True}
+
+
+@app.post("/api/admin/users/{target_username}/approve")
+def admin_approve_user(
+    target_username: str,
+    admin_username: str = Depends(current_admin),
+):
+    conn = db()
+
+    try:
+        user = conn.execute(
+            "SELECT account_status FROM users WHERE username=?",
+            (target_username,),
+        ).fetchone()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User tidak ditemukan.")
+
+        if user["account_status"] == "DELETED":
+            raise HTTPException(status_code=400, detail="User deleted harus direstore terlebih dahulu.")
+
+        conn.execute(
+            """
+            UPDATE users
+            SET account_status='ACTIVE',
+                approved_at=?,
+                approved_by=?,
+                revoked_at=NULL,
+                revoked_by=NULL,
+                deleted_at=NULL,
+                deleted_by=NULL
+            WHERE username=?
+            """,
+            (
+                now_iso(),
+                admin_username,
+                target_username,
+            ),
+        )
+
+        record_admin_audit(conn, admin_username, "USER_APPROVED", target_username)
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    return {"ok": True}
+
+
+@app.post("/api/admin/users/{target_username}/reject")
+def admin_reject_user(
+    target_username: str,
+    data: AdminUserReasonIn,
+    admin_username: str = Depends(current_admin),
+):
+    conn = db()
+
+    try:
+        user = conn.execute(
+            "SELECT account_status FROM users WHERE username=?",
+            (target_username,),
+        ).fetchone()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User tidak ditemukan.")
+
+        if user["account_status"] == "DELETED":
+            raise HTTPException(status_code=400, detail="User deleted harus direstore terlebih dahulu.")
+
+        conn.execute(
+            """
+            UPDATE users
+            SET account_status='REJECTED',
+                revoked_at=NULL,
+                revoked_by=NULL,
+                deleted_at=NULL,
+                deleted_by=NULL
+            WHERE username=?
+            """,
+            (
+                target_username,
+            ),
+        )
+
+        record_admin_audit(
+            conn,
+            admin_username,
+            "USER_REJECTED",
+            target_username,
+            {"reason": data.reason or ""},
+        )
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    return {"ok": True}
+
+
+@app.post("/api/admin/users/{target_username}/revoke")
+def admin_revoke_user(
+    target_username: str,
+    data: AdminUserReasonIn,
+    admin_username: str = Depends(current_admin),
+):
+    conn = db()
+
+    try:
+        user = conn.execute(
+            "SELECT account_status FROM users WHERE username=?",
+            (target_username,),
+        ).fetchone()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User tidak ditemukan.")
+
+        if user["account_status"] == "DELETED":
+            raise HTTPException(status_code=400, detail="User deleted harus direstore terlebih dahulu.")
+
+        conn.execute(
+            """
+            UPDATE users
+            SET account_status='REJECTED',
+                revoked_at=?,
+                revoked_by=?,
+                deleted_at=NULL,
+                deleted_by=NULL
+            WHERE username=?
+            """,
+            (
+                now_iso(),
+                admin_username,
+                target_username,
+            ),
+        )
+
+        record_admin_audit(
+            conn,
+            admin_username,
+            "USER_REVOKED",
+            target_username,
+            {"reason": data.reason or ""},
+        )
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    return {"ok": True}
+
+
+@app.post("/api/admin/users/{target_username}/restore")
+def admin_restore_user(
+    target_username: str,
+    admin_username: str = Depends(current_admin),
+):
+    conn = db()
+
+    try:
+        user = conn.execute(
+            "SELECT account_status FROM users WHERE username=?",
+            (target_username,),
+        ).fetchone()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User tidak ditemukan.")
+
+        if user["account_status"] not in {"REJECTED", "DELETED"}:
+            raise HTTPException(status_code=400, detail="Hanya user rejected atau deleted yang bisa direstore.")
+
+        conn.execute(
+            """
+            UPDATE users
+            SET account_status='ACTIVE',
+                approved_at=COALESCE(approved_at, ?),
+                approved_by=COALESCE(approved_by, ?),
+                revoked_at=NULL,
+                revoked_by=NULL,
+                deleted_at=NULL,
+                deleted_by=NULL
+            WHERE username=?
+            """,
+            (
+                now_iso(),
+                admin_username,
+                target_username,
+            ),
+        )
+
+        record_admin_audit(conn, admin_username, "USER_RESTORED", target_username)
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    return {"ok": True}
+
+
+@app.post("/api/admin/users/{target_username}/soft-delete")
+def admin_soft_delete_user(
+    target_username: str,
+    admin_username: str = Depends(current_admin),
+):
+    conn = db()
+
+    try:
+        if not conn.execute("SELECT 1 FROM users WHERE username=?", (target_username,)).fetchone():
+            raise HTTPException(status_code=404, detail="User tidak ditemukan.")
+
+        conn.execute(
+            """
+            UPDATE users
+            SET account_status='DELETED',
+                deleted_at=?,
+                deleted_by=?
+            WHERE username=?
+            """,
+            (
+                now_iso(),
+                admin_username,
+                target_username,
+            ),
+        )
+
+        record_admin_audit(conn, admin_username, "USER_SOFT_DELETED", target_username)
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    return {"ok": True}
+
+
 @app.post("/api/register")
 def register(data: RegisterIn):
 
@@ -688,8 +1414,9 @@ def register(data: RegisterIn):
         conn.close()
 
     return {
-        "token": sign_token(data.username),
         "username": data.username,
+        "account_status": "PENDING",
+        "message": "Registrasi berhasil. Akun sedang menunggu approval administrator.",
     }
 
 
@@ -697,13 +1424,32 @@ def register(data: RegisterIn):
 def login(data: LoginIn, request: Request):
     rate_key = check_login_rate(request, data.username)
     conn = db()
-    row = conn.execute("SELECT password_hash FROM users WHERE username=?", (data.username,)).fetchone()
+    row = conn.execute(
+        """
+        SELECT
+            password_hash,
+            account_status
+        FROM users
+        WHERE username=?
+        """,
+        (
+            data.username,
+        ),
+    ).fetchone()
     conn.close()
     if not row or not verify_password(data.password, row["password_hash"]):
         record_login_failure(rate_key)
         raise HTTPException(status_code=401, detail="Username atau password salah.")
+
     clear_login_failures(rate_key)
-    return {"token": sign_token(data.username), "username": data.username}
+
+    enforce_active_account(row["account_status"])
+
+    return {
+        "token": sign_token(data.username),
+        "username": data.username,
+        "account_status": row["account_status"],
+    }
 
 @app.get("/api/certificate/requests")
 def certificate_requests(username: str = Depends(current_user)):

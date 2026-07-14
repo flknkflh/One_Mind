@@ -16,6 +16,7 @@
       <div class="session">
         <span id="sessionText">Belum login</span>
         <button id="logoutBtn" class="ghost hidden">Logout</button>
+        <button id="adminLogoutBtn" class="ghost hidden">Logout Admin</button>
       </div>
     </section>
 
@@ -147,8 +148,157 @@
 
       </form>
 
+      <!-- ================= ADMIN ================= -->
+
+      <section class="panel adminAuthPanel">
+
+        <h2>Administrator</h2>
+
+        <div id="adminSetupBox" class="hidden">
+
+          <p>Inisialisasi administrator pertama. Setelah dibuat, setup ini akan terkunci.</p>
+
+          <form id="adminSetupForm">
+
+            <label>
+              Username Admin
+              <input
+                name="username"
+                autocomplete="username"
+                required
+                minlength="3">
+            </label>
+
+            <label>
+              Password Admin
+              <input
+                name="password"
+                type="password"
+                autocomplete="new-password"
+                required
+                minlength="8">
+            </label>
+
+            <button type="submit">Inisialisasi Admin</button>
+
+          </form>
+
+        </div>
+
+        <form id="adminLoginForm" class="hidden">
+
+          <p>Login admin terpisah dari akun user biasa.</p>
+
+          <label>
+            Username Admin
+            <input
+              name="username"
+              autocomplete="username"
+              required>
+          </label>
+
+          <label>
+            Password Admin
+            <input
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              required>
+          </label>
+
+          <button type="submit">Login Admin</button>
+
+        </form>
+
+      </section>
+
     </section>
-        <section id="appView" class="hidden">
+
+    <section id="adminView" class="hidden">
+
+      <div class="workspace">
+
+        <section class="metrics">
+
+          <div>
+            <span>Pending</span>
+            <strong id="adminPendingCount">0</strong>
+          </div>
+
+          <div>
+            <span>Active</span>
+            <strong id="adminActiveCount">0</strong>
+          </div>
+
+          <div>
+            <span>Rejected</span>
+            <strong id="adminRejectedCount">0</strong>
+          </div>
+
+          <div>
+            <span>Deleted</span>
+            <strong id="adminDeletedCount">0</strong>
+          </div>
+
+        </section>
+
+        <section class="panel">
+
+          <div class="panelHead">
+
+            <div>
+              <h2>Dashboard Administrator</h2>
+              <p>Kelola lifecycle akun user dan pantau status certificate.</p>
+            </div>
+
+            <button id="refreshAdminBtn" class="ghost" type="button">Muat ulang</button>
+
+          </div>
+
+          <div id="adminAccountGroups" class="lifecycleGrid"></div>
+
+        </section>
+
+        <section class="panel">
+
+          <h2>Status Certificate</h2>
+
+          <div id="adminCertificateGroups" class="certificateSummary"></div>
+
+        </section>
+
+        <form id="adminPasswordForm" class="panel">
+
+          <h2>Ubah Password Admin</h2>
+
+          <label>
+            Password Saat Ini
+            <input
+              name="current_password"
+              type="password"
+              autocomplete="current-password"
+              required>
+          </label>
+
+          <label>
+            Password Baru
+            <input
+              name="new_password"
+              type="password"
+              autocomplete="new-password"
+              required
+              minlength="8">
+          </label>
+
+          <button type="submit">Ubah Password</button>
+
+        </form>
+
+      </div>
+
+    </section>
+
+    <section id="appView" class="hidden">
       <div class="appChrome">
 
         <aside class="sidebar">
@@ -365,6 +515,6 @@
     <section id="notice" class="notice hidden"></section>
     <input id="updateFileInput" class="hidden" type="file">
   </main>
-  <script src="/static/app.js?v=20260714-pki1"></script>
+  <script src="/static/app.js?v=20260714-account-status1"></script>
 </body>
 </html>
