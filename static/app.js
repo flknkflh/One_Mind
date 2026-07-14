@@ -1675,6 +1675,12 @@ on("registerForm", "submit", async (evt) => {
 
                 password,
 
+                nip: form.get("nip").trim(),
+
+                rank: form.get("rank").trim(),
+
+                position: form.get("position").trim(),
+
                 // DIPP Public Key
                 public_key: dipp.public,
 
