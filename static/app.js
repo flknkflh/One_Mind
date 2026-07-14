@@ -1405,6 +1405,16 @@ function renderAuth() {
 
 }
 
+function resetAuthInputs() {
+
+    $("registerForm")?.reset();
+
+    $("loginForm")?.reset();
+
+    selectedDippFile = null;
+
+}
+
 async function refreshAll() {
   if (!state.token) return;
   state.files = await api("/api/files");
@@ -2178,6 +2188,8 @@ on("logoutBtn", "click", () => {
   state.token = null;
   state.username = null;
   state.unlockedPrivateKey = null;
+
+  resetAuthInputs();
 
   updateLocalKeyStatus();
 
