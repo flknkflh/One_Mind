@@ -8,8 +8,8 @@ const state = {
   fileScope: "all",
   userQuery: "",
   unlockedPrivateKey: null,
-  keyUnlockedUntil: 0,
-  keyLockTimer: null,
+ // keyUnlockedUntil: 0,
+ // keyLockTimer: null,
 };
 let selectedDippFile = null;
 
@@ -23,10 +23,26 @@ const dippSession = {
 
 };
 
+const pkiSession = {
+
+    privateKey: null,
+
+    publicKey: null,
+
+    username: null,
+
+    csr: null,
+
+    certificate: null
+
+};
+
+const PKI_RSA_BITS = 4096;
+const PKI_HASH = "SHA-512";
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const BACKUP_KEY_ITERATIONS = 600000;
-const SESSION_UNLOCK_MS = 15 * 60 * 1000;
+// const SESSION_UNLOCK_MS = 15 * 60 * 1000;
 const CHUNK_PROFILES = [
 
     // ≤10 MB → tidak perlu dipecah (1 chunk)
@@ -108,10 +124,19 @@ function bytesToB64(bytes) {
 }
 
 function b64ToBytes(text) {
-  const binary = atob(text);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-  return out;
+
+    console.log("BASE64 INPUT =", text);
+
+    const binary = atob(text);
+
+    const out = new Uint8Array(binary.length);
+
+    for (let i = 0; i < binary.length; i++) {
+        out[i] = binary.charCodeAt(i);
+    }
+
+    return out;
+
 }
 
 function chooseChunkSize(fileSize) {
@@ -212,6 +237,12 @@ async function api(path, options = {}) {
     );
 
     const data = await res.json().catch(() => ({}));
+
+    // ============================
+    // DEBUG
+    // ============================
+    console.log("API:", path);
+    console.log(data);
 
     if (!res.ok) {
 
@@ -377,6 +408,149 @@ function generateDippKeypair(params = DIPP_PARAMS) {
   return {public: publicKey, private: {x: kg.x, w: kg.w, delta: kg.delta}};
 }
 
+async function generatePKIKeypair() {
+
+    const pair = await crypto.subtle.generateKey(
+
+        {
+
+            name: "RSASSA-PKCS1-v1_5",
+
+            modulusLength: PKI_RSA_BITS,
+
+            publicExponent: new Uint8Array([1, 0, 1]),
+
+            hash: PKI_HASH
+
+        },
+
+        true,
+
+        [
+
+            "sign",
+
+            "verify"
+
+        ]
+
+    );
+
+    pkiSession.privateKey = pair.privateKey;
+
+    pkiSession.publicKey = pair.publicKey;
+
+    pkiSession.username = state.username;
+
+    return pair;
+
+}
+
+function arrayBufferToBase64(buffer) {
+
+    const bytes = new Uint8Array(buffer);
+
+    let binary = "";
+
+    for (const b of bytes) {
+        binary += String.fromCharCode(b);
+    }
+
+    return btoa(binary);
+
+}
+
+async function signChallenge(nonceHex) {
+
+    if (!pkiSession.privateKey) {
+        throw new Error("PKI Private Key belum tersedia.");
+    }
+
+    const nonceBytes = new TextEncoder().encode(nonceHex);
+
+    const signature = await crypto.subtle.sign(
+        {
+            name: "RSASSA-PKCS1-v1_5"
+        },
+        pkiSession.privateKey,
+        nonceBytes
+    );
+
+    return arrayBufferToBase64(signature);
+
+}
+
+async function exportPKIPrivateKey() {
+
+    if (!pkiSession.privateKey) {
+
+        throw new Error(
+            "PKI Private Key belum tersedia."
+        );
+
+    }
+
+    const pkcs8 = await crypto.subtle.exportKey(
+
+        "pkcs8",
+
+        pkiSession.privateKey
+
+    );
+
+    return new Uint8Array(pkcs8);
+
+}
+
+function downloadPKIPrivateKey(
+
+    username,
+
+    bytes
+
+) {
+
+    const blob = new Blob(
+
+        [bytes],
+
+        {
+
+            type: "application/octet-stream"
+
+        }
+
+    );
+
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+
+    a.href = url;
+
+    a.download = `${username}.key`;
+
+    a.click();
+
+    URL.revokeObjectURL(url);
+
+}
+
+async function exportPKIIdentity() {
+
+    const bytes =
+        await exportPKIPrivateKey();
+
+    downloadPKIPrivateKey(
+
+        state.username,
+
+        bytes
+
+    );
+
+}
+
 function dippWrapBytes(publicKey, keyBytes) {
   const params = {
     dim: publicKey.dim,
@@ -431,16 +605,80 @@ function dippUnwrapBytes(privateEntry, wrapped) {
   return bitsToBytes(bits);
 }
 
+/*
 async function createKeyBundle(username) {
 
+    // ============================
+    // Generate DIPP
+    // ============================
+
     const dipp = generateDippKeypair();
+
+    // ============================
+    // Generate RSA PKI
+    // ============================
+
+    await generatePKIKeypair();
+
+    // ============================
+    // Simpan DIPP di RAM
+    // ============================
+
+    dippSession.privateKey = dipp;
+    dippSession.publicKey = dipp.public;
+    dippSession.username = username;
+
+    state.unlockedPrivateKey = dipp;
+
+    // ============================
+    // Export Identitas DIPP
+    // ============================
 
     await exportDippIdentity(
         username,
         dipp
     );
 
-    return dipp.public;
+    // ============================
+    // Return seluruh bundle
+    // ============================
+
+    return {
+        dippPublic: dipp.public,
+        pkiPublicKey: pkiSession.publicKey
+    };
+
+}
+*/
+
+async function exportPKIPublicKey() {
+
+    if (!pkiSession.publicKey) {
+        throw new Error("PKI Public Key belum tersedia.");
+    }
+
+    const spki = await crypto.subtle.exportKey(
+        "spki",
+        pkiSession.publicKey
+    );
+
+    const bytes = new Uint8Array(spki);
+
+    let binary = "";
+
+    for (const b of bytes) {
+        binary += String.fromCharCode(b);
+    }
+
+    const base64 = btoa(binary);
+
+    const lines = base64.match(/.{1,64}/g).join("\n");
+
+    return (
+        "-----BEGIN PUBLIC KEY-----\n" +
+        lines +
+        "\n-----END PUBLIC KEY-----"
+    );
 
 }
 
@@ -563,17 +801,12 @@ async function importDippIdentity(
     state.unlockedPrivateKey =
         dipp;
 
-    state.keyUnlockedUntil =
-        Date.now() +
-        SESSION_UNLOCK_MS;
-
-    armKeyLockTimer();
-
     updateLocalKeyStatus();
 
     return dipp;
 
 }
+
 function hasLocalPrivateKey(username = state.username) {
 
     return Boolean(
@@ -583,56 +816,12 @@ function hasLocalPrivateKey(username = state.username) {
 
 }
 
-function isKeyUnlocked() {
-  return Boolean(state.unlockedPrivateKey && Date.now() < state.keyUnlockedUntil);
-}
-
-function lockPrivateKeySession(reason = "Identitas DIPP telah dihapus dari memori aplikasi.") {
-  state.unlockedPrivateKey = null;
-  state.keyUnlockedUntil = 0;
-  if (state.keyLockTimer) clearTimeout(state.keyLockTimer);
-  state.keyLockTimer = null;
-  updateLocalKeyStatus();
-  if (reason) showNotice(reason);
-}
-
-function armKeyLockTimer() {
-  if (state.keyLockTimer) clearTimeout(state.keyLockTimer);
-  const delay = Math.max(0, state.keyUnlockedUntil - Date.now());
-  state.keyLockTimer = setTimeout(() => lockPrivateKeySession("Session key timeout. Unlock ulang untuk membuka file."), delay);
-}
-
-async function unlockPrivateKeySession() {
-
-    if (
-        !dippSession.privateKey
-    ) {
-
-        throw new Error(
-            "Silakan import file identitas DIPP."
-        );
-
-    }
-
-    state.unlockedPrivateKey =
-        dippSession.privateKey;
-
-    state.keyUnlockedUntil =
-        Date.now() +
-        SESSION_UNLOCK_MS;
-
-    armKeyLockTimer();
-
-    updateLocalKeyStatus();
-
-    return dippSession.privateKey;
-
-}
-
 async function ensureUnlockedPrivateKey() {
 
-    if (isKeyUnlocked()) {
+    if (state.unlockedPrivateKey) {
+
         return state.unlockedPrivateKey;
+
     }
 
     throw new Error(
@@ -640,6 +829,7 @@ async function ensureUnlockedPrivateKey() {
     );
 
 }
+
 function updateLocalKeyStatus() {
 
     const status =
@@ -949,11 +1139,28 @@ async function decryptEnvelope(envelope, key) {
   return new Blob([plain], {type: envelope.mime || "application/octet-stream"});
 }
 
-async function getFileKey(fileId, password) {
-  const file = await api(`/api/files/${fileId}`);
-  const privateKey = password ? await unlockPrivateKeySession(password) : await ensureUnlockedPrivateKey();
-  const fileKey = await unwrapFileKey(file.wrapped_key, privateKey);
-  return {file, fileKey};
+async function getFileKey(fileId) {
+
+    const file =
+        await api(`/api/files/${fileId}`);
+
+    const privateKey =
+        await ensureUnlockedPrivateKey();
+
+    const fileKey =
+        await unwrapFileKey(
+            file.wrapped_key,
+            privateKey
+        );
+
+    return {
+
+        file,
+
+        fileKey
+
+    };
+
 }
 
 async function wrapKeyForAccess(fileKey, fileId) {
@@ -1010,40 +1217,151 @@ async function deleteFile(fileId) {
 }
 
 async function updateFileWithRotation(fileId, replacementFile) {
-  if (!replacementFile || !replacementFile.size) return;
-  const current = await getFileKey(fileId);
-  await decryptEnvelope(current.file.envelope, current.fileKey);
-  const encrypted = await encryptFile(replacementFile);
-  const wrapped_keys = await wrapKeyForAccess(encrypted.key, fileId);
-  await api(`/api/files/${fileId}`, {
-    method: "PUT",
-    body: JSON.stringify({
-      filename: replacementFile.name,
-      envelope: encrypted.envelope,
-      wrapped_keys,
-    }),
-  });
-  await refreshAll();
-  showNotice("File berhasil diupdate. AES key baru sudah dibungkus ulang untuk semua user yang punya akses.");
+
+    console.log("1. UPDATE START");
+
+    if (!replacementFile || !replacementFile.size)
+        return;
+
+    console.log("2. FILE OK");
+
+    const current = await getFileKey(fileId);
+
+    console.log("3. GET FILE OK");
+
+    await decryptEnvelope(
+        current.file.envelope,
+        current.fileKey
+    );
+
+    console.log("4. DECRYPT OK");
+
+    const encrypted = await encryptFile(
+        replacementFile
+    );
+
+    console.log("5. ENCRYPT OK");
+
+    encrypted.envelope.ciphertext_b64 =
+        bytesToB64(encrypted.ciphertext);
+
+    encrypted.envelope.file_id =
+        current.file.envelope.file_id;
+
+    encrypted.envelope.uploaded_at =
+        current.file.envelope.uploaded_at;
+
+    encrypted.envelope.version =
+        (current.file.envelope.version || 1) + 1;
+
+    console.log("6. ENVELOPE READY");
+
+    const wrapped_keys =
+        await wrapKeyForAccess(
+            encrypted.key,
+            fileId
+        );
+
+    console.log("7. WRAP OK");
+
+    console.log("8. SEND PUT");
+
+    await api(
+        `/api/files/${fileId}`,
+        {
+            method: "PUT",
+            body: JSON.stringify({
+                filename: replacementFile.name,
+                envelope: encrypted.envelope,
+                wrapped_keys
+            })
+        }
+    );
+
+    console.log("9. PUT SUCCESS");
+
+    await refreshAll();
+
+    console.log("10. REFRESH OK");
+
+    showNotice("Update selesai.");
 }
 
 async function rotateCurrentFileKey(fileId) {
-  const current = await getFileKey(fileId);
-  const blob = await decryptEnvelope(current.file.envelope, current.fileKey);
-  const sameFile = new File([blob], current.file.filename, {type: current.file.envelope.mime || "application/octet-stream"});
-  const encrypted = await encryptFile(sameFile);
-  const wrapped_keys = await wrapKeyForAccess(encrypted.key, fileId);
-  await api(`/api/files/${fileId}`, {
-    method: "PUT",
-    body: JSON.stringify({
-      filename: current.file.filename,
-      envelope: encrypted.envelope,
-      wrapped_keys,
-    }),
-  });
-  await refreshAll();
-  await renderAccess(fileId);
-  showNotice("AES key file berhasil dirotasi dan dibungkus ulang untuk akses aktif.");
+
+    const current = await getFileKey(fileId);
+
+    const blob = await decryptEnvelope(
+        current.file.envelope,
+        current.fileKey
+    );
+
+    const sameFile = new File(
+        [blob],
+        current.file.filename,
+        {
+            type: current.file.envelope.mime || "application/octet-stream"
+        }
+    );
+
+    const encrypted = await encryptFile(
+        sameFile
+    );
+
+    encrypted.envelope.ciphertext_b64 =
+        bytesToB64(
+            encrypted.ciphertext
+        );
+
+    // =====================================
+    // Pertahankan Identitas File
+    // =====================================
+
+    encrypted.envelope.file_id =
+        current.file.envelope.file_id;
+
+    encrypted.envelope.version =
+        (current.file.envelope.version || 1) + 1;
+
+    encrypted.envelope.uploaded_at =
+        current.file.envelope.uploaded_at;
+
+    // =====================================
+
+    console.log("========== UPDATE ENVELOPE ==========");
+    console.log(encrypted.envelope);
+    console.log(Object.keys(encrypted.envelope));
+    console.log(
+        "ciphertext length =",
+        encrypted.envelope.ciphertext_b64?.length
+    );
+    console.log("=====================================");
+
+    const wrapped_keys = await wrapKeyForAccess(
+        encrypted.key,
+        fileId
+    );
+
+    await api(
+        `/api/files/${fileId}`,
+        {
+            method: "PUT",
+            body: JSON.stringify({
+                filename: current.file.filename,
+                envelope: encrypted.envelope,
+                wrapped_keys
+            })
+        }
+    );
+
+    await refreshAll();
+
+    await renderAccess(fileId);
+
+    showNotice(
+        `AES Key berhasil dirotasi.\n\nVersi file sekarang: ${encrypted.envelope.version}`
+    );
+
 }
 
 function renderAuth() {
@@ -1097,56 +1415,172 @@ async function refreshAll() {
 }
 
 function renderFiles() {
-  const list = $("fileList");
-  if (!list) return;
-  list.innerHTML = "";
-  if ($("totalFiles")) $("totalFiles").textContent = String(state.files.length);
-  if ($("ownedFiles")) $("ownedFiles").textContent = String(state.files.filter(f => f.owner === state.username).length);
-  if ($("sharedFiles")) $("sharedFiles").textContent = String(state.files.filter(f => f.owner !== state.username).length);
-  if ($("userCount")) $("userCount").textContent = String(state.users.length);
 
-  const query = normalized(state.fileQuery);
-  const filtered = state.files.filter(file => {
-    const role = file.permission || (file.owner === state.username ? "owner" : "viewer");
-    const haystack = normalized(`${file.filename} ${file.owner} ${role} ${file.created_at}`);
-    const matchesQuery = !query || haystack.includes(query);
-    const matchesScope =
-      state.fileScope === "all" ||
-      (state.fileScope === "owned" && file.owner === state.username) ||
-      (state.fileScope === "shared" && file.owner !== state.username) ||
-      (state.fileScope === "editor" && role === "editor") ||
-      (state.fileScope === "viewer" && role === "viewer");
-    return matchesQuery && matchesScope;
-  });
+    const list = $("fileList");
 
-  if (!state.files.length) {
-    list.innerHTML = `<div class="emptyState"><strong>Belum ada file</strong><p>Upload file pertama dari tab Upload Terenkripsi.</p></div>`;
-    return;
-  }
-  if (!filtered.length) {
-    list.innerHTML = `<div class="emptyState"><strong>Tidak ada hasil</strong><p>Ubah kata kunci search atau filter file.</p></div>`;
-    return;
-  }
-  for (const file of filtered) {
-    const row = document.createElement("div");
-    row.className = "item";
-    const role = file.permission || (file.owner === state.username ? "owner" : "viewer");
-    const actions = [
-      `<button data-download="${file.id}">Unduh</button>`,
-      canEdit(file) ? `<button class="ghost" data-update="${file.id}">Update & rotate key</button>` : "",
-      canEdit(file) ? `<button class="ghost" data-rename="${file.id}">Rename</button>` : "",
-      canManage(file) ? `<button class="ghost" data-access="${file.id}">Akses</button>` : "",
-      canManage(file) ? `<button class="danger" data-delete="${file.id}">Delete</button>` : "",
-    ].join("");
-    row.innerHTML = `
-      <div>
-        <strong>${escapeHtml(file.filename)}</strong>
-        <span class="meta">Pemilik: ${escapeHtml(file.owner)} | Role: ${escapeHtml(role)} | ${file.encrypted_size} byte | ${escapeHtml(file.created_at)}</span>
-      </div>
-      <div class="itemActions">${actions}</div>
-    `;
-    list.appendChild(row);
-  }
+    if (!list) return;
+
+    list.innerHTML = "";
+
+    if ($("totalFiles"))
+        $("totalFiles").textContent = String(state.files.length);
+
+    if ($("ownedFiles"))
+        $("ownedFiles").textContent = String(
+            state.files.filter(f => f.owner === state.username).length
+        );
+
+    if ($("sharedFiles"))
+        $("sharedFiles").textContent = String(
+            state.files.filter(f => f.owner !== state.username).length
+        );
+
+    if ($("userCount"))
+        $("userCount").textContent = String(state.users.length);
+
+    const query = normalized(state.fileQuery);
+
+    const filtered = state.files.filter(file => {
+
+        const role =
+            file.permission ||
+            (file.owner === state.username ? "owner" : "viewer");
+
+        const haystack = normalized(
+            `${file.filename} ${file.owner} ${role} ${file.created_at}`
+        );
+
+        const matchesQuery =
+            !query || haystack.includes(query);
+
+        const matchesScope =
+            state.fileScope === "all" ||
+            (state.fileScope === "owned" && file.owner === state.username) ||
+            (state.fileScope === "shared" && file.owner !== state.username) ||
+            (state.fileScope === "editor" && role === "editor") ||
+            (state.fileScope === "viewer" && role === "viewer");
+
+        return matchesQuery && matchesScope;
+
+    });
+
+    if (!state.files.length) {
+
+        list.innerHTML =
+            `<div class="emptyState">
+                <strong>Belum ada file</strong>
+                <p>Upload file pertama dari tab Upload Terenkripsi.</p>
+            </div>`;
+
+        return;
+
+    }
+
+    if (!filtered.length) {
+
+        list.innerHTML =
+            `<div class="emptyState">
+                <strong>Tidak ada hasil</strong>
+                <p>Ubah kata kunci search atau filter file.</p>
+            </div>`;
+
+        return;
+
+    }
+
+    for (const file of filtered) {
+
+        const row = document.createElement("div");
+
+        row.className = "item";
+
+        const role =
+            file.permission ||
+            (file.owner === state.username ? "owner" : "viewer");
+
+        const env = file.envelope || {};
+
+        const fileId =
+            env.file_id || file.id;
+
+        const version =
+            env.version ?? "-";
+
+        const uploaded =
+            env.uploaded_at
+                ? new Date(env.uploaded_at).toLocaleString()
+                : "-";
+
+        const actions = [
+
+            `<button data-download="${file.id}">Unduh</button>`,
+
+            canEdit(file)
+                ? `<button class="ghost" data-update="${file.id}">Update & Rotate Key</button>`
+                : "",
+
+            canEdit(file)
+                ? `<button class="ghost" data-rename="${file.id}">Rename</button>`
+                : "",
+
+            canManage(file)
+                ? `<button class="ghost" data-access="${file.id}">Akses</button>`
+                : "",
+
+            canManage(file)
+                ? `<button class="danger" data-delete="${file.id}">Delete</button>`
+                : ""
+
+        ].join("");
+
+        row.innerHTML = `
+
+            <div>
+
+                <strong>${escapeHtml(file.filename)}</strong>
+
+                <div class="meta">
+
+                    <div><b>🆔 File ID</b> :
+                        <code>${escapeHtml(fileId)}</code>
+                    </div>
+
+                    <div><b>📝 Version</b> :
+                        ${escapeHtml(String(version))}
+                    </div>
+
+                    <div><b>📅 Uploaded</b> :
+                        ${escapeHtml(uploaded)}
+                    </div>
+
+                    <div><b>👤 Owner</b> :
+                        ${escapeHtml(file.owner)}
+                    </div>
+
+                    <div><b>🔐 Role</b> :
+                        ${escapeHtml(role)}
+                    </div>
+
+                    <div><b>💾 Size</b> :
+                        ${Number(file.encrypted_size).toLocaleString()} byte
+                    </div>
+
+                </div>
+
+            </div>
+
+            <div class="itemActions">
+
+                ${actions}
+
+            </div>
+
+        `;
+
+        list.appendChild(row);
+
+    }
+
 }
 
 function renderUsers() {
@@ -1214,6 +1648,18 @@ on("registerForm", "submit", async (evt) => {
     const dipp = generateDippKeypair();
 
     // ============================
+    // Generate PKI RSA Keypair
+    // ============================
+
+    await generatePKIKeypair();
+
+    // ============================
+    // Export PKI Public Key
+    // ============================
+
+    const pkiPublicKey = await exportPKIPublicKey();
+
+    // ============================
     // Register ke Server
     // ============================
 
@@ -1229,7 +1675,11 @@ on("registerForm", "submit", async (evt) => {
 
                 password,
 
-                public_key: dipp.public
+                // DIPP Public Key
+                public_key: dipp.public,
+
+                // PKI RSA Public Key
+                pki_public_key: pkiPublicKey
 
             }),
         }
@@ -1265,10 +1715,11 @@ on("registerForm", "submit", async (evt) => {
 
     state.unlockedPrivateKey = dipp;
 
-    state.keyUnlockedUntil =
-        Date.now() + SESSION_UNLOCK_MS;
+    // ============================
+    // Lengkapi informasi PKI
+    // ============================
 
-    armKeyLockTimer();
+    pkiSession.username = username;
 
     updateLocalKeyStatus();
 
@@ -1335,8 +1786,10 @@ on("importDippInput", "change", async (evt) => {
             state.username
         );
 
+        updateLocalKeyStatus();
+
         showNotice(
-            "Identitas DIPP berhasil dimuat."
+            "Identitas DIPP berhasil diimport."
         );
 
     }
@@ -1351,42 +1804,9 @@ on("importDippInput", "change", async (evt) => {
 
     finally {
 
-        evt.currentTarget.value = "";
-
-    }
-
-});
-
-on("importDippInput", "change", async (evt) => {
-
-    const file = evt.currentTarget.files[0];
-
-    if (!file) return;
-
-    try {
-
-        await importDippIdentity(
-            file,
-            state.username
-        );
-
-        updateLocalKeyStatus();
-
-        showNotice(
-            "Identitas DIPP berhasil diimport."
-        );
-
-    }
-
-    catch (err) {
-
-        showNotice(err.message);
-
-    }
-
-    finally {
-
-        evt.currentTarget.value = "";
+        if (evt.currentTarget) {
+            evt.currentTarget.value = "";
+        }
 
     }
 
@@ -1457,12 +1877,6 @@ on("loginForm", "submit", async (evt) => {
     selectedDippFile,
     username
   );
-
-  // ============================
-  // Unlock ke RAM
-  // ============================
-
-  await unlockPrivateKeySession();
 
   renderAuth();
 
@@ -1641,15 +2055,40 @@ on("accessList", "click", async (evt) => {
   await renderAccess(btn.dataset.file);
   showNotice("Akses berhasil dicabut. Untuk keamanan penuh, update file agar AES key dirotasi.");
 });
+
 on("updateFileInput", "change", async (evt) => {
-  const file = evt.currentTarget.files[0];
-  const fileId = state.pendingUpdateFileId;
-  try {
-    if (fileId) await updateFileWithRotation(fileId, file);
-  } finally {
-    state.pendingUpdateFileId = null;
-    evt.currentTarget.value = "";
-  }
+
+    const input = evt.currentTarget;
+
+    const file = input?.files?.[0];
+
+    const fileId = state.pendingUpdateFileId;
+
+    try {
+
+        if (fileId && file) {
+
+            await updateFileWithRotation(
+                fileId,
+                file
+            );
+
+        }
+
+    }
+
+    finally {
+
+        state.pendingUpdateFileId = null;
+
+        if (input) {
+
+            input.value = "";
+
+        }
+
+    }
+
 });
 
 on("exportDippBtn", "click", async () => {
@@ -1701,17 +2140,31 @@ on("exportDippBtn", "click", async () => {
     }
 
 });
+
 on("logoutBtn", "click", () => {
 
-  // Hapus private key DIPP dari RAM
+  // ============================
+  // Hapus DIPP dari RAM
+  // ============================
+
   dippSession.privateKey = null;
   dippSession.publicKey = null;
   dippSession.username = null;
 
-  // Lock session key
-  lockPrivateKeySession("");
+  // ============================
+  // Hapus PKI dari RAM
+  // ============================
 
+  pkiSession.privateKey = null;
+  pkiSession.publicKey = null;
+  pkiSession.username = null;
+  pkiSession.csr = null;
+  pkiSession.certificate = null;
+
+  // ============================
   // Hapus session login
+  // ============================
+
   localStorage.removeItem("om_token");
   localStorage.removeItem("om_username");
   localStorage.removeItem("om_last_password_hint");
@@ -1719,6 +2172,8 @@ on("logoutBtn", "click", () => {
   state.token = null;
   state.username = null;
   state.unlockedPrivateKey = null;
+
+  updateLocalKeyStatus();
 
   renderAuth();
 

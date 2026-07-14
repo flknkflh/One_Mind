@@ -7,15 +7,26 @@ import secrets
 import sqlite3
 import time
 import shutil
+import secrets
+import base64
+
+from cryptography import x509
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Literal
+from pathlib import Path
+
+
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from app.pki.pki import issue_certificate   
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.exceptions import InvalidSignature
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -203,6 +214,36 @@ def record_login_failure(key: str) -> None:
 def clear_login_failures(key: str) -> None:
     FAILED_LOGINS.pop(key, None)
 
+def verify_pki_signature(
+    public_key_pem: str,
+    nonce: str,
+    signature_b64: str,
+) -> bool:
+
+    try:
+
+        public_key = serialization.load_pem_public_key(
+            public_key_pem.encode("utf-8")
+        )
+
+        signature = base64.b64decode(
+            signature_b64,
+            validate=True
+        )
+
+        public_key.verify(
+            signature,
+            nonce.encode("utf-8"),
+            padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+
+        return True
+
+    except Exception:
+
+        return False
+
 
 def file_permission(conn: sqlite3.Connection, file_id: str, username: str) -> str | None:
     file_row = conn.execute("SELECT owner FROM files WHERE id=?", (file_id,)).fetchone()
@@ -242,18 +283,45 @@ def db() -> sqlite3.Connection:
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
+
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
+
             display_name TEXT NOT NULL,
+
             password_hash TEXT NOT NULL,
+
+            nip TEXT NOT NULL,
+
+            rank TEXT NOT NULL,
+
+            position TEXT NOT NULL,
+
             public_key TEXT NOT NULL,
-            created_at TEXT NOT NULL
+
+            pki_public_key TEXT,
+
+            account_status TEXT NOT NULL DEFAULT 'PENDING',
+
+            certificate_status TEXT NOT NULL DEFAULT 'NONE',
+
+            created_at TEXT NOT NULL,
+
+            approved_at TEXT,
+            approved_by TEXT,
+
+            revoked_at TEXT,
+            revoked_by TEXT,
+
+            deleted_at TEXT,
+            deleted_by TEXT
         );
 
         CREATE TABLE IF NOT EXISTS files (
@@ -278,9 +346,46 @@ def db() -> sqlite3.Connection:
             FOREIGN KEY(owner) REFERENCES users(username),
             FOREIGN KEY(recipient) REFERENCES users(username)
         );
+
+        CREATE TABLE IF NOT EXISTS certificate_requests (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            csr_pem TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            requested_at TEXT NOT NULL,
+            approved_at TEXT,
+            approved_by TEXT,
+            FOREIGN KEY(username) REFERENCES users(username)
+        );
+
+        CREATE TABLE IF NOT EXISTS certificate_challenges (
+            username TEXT PRIMARY KEY,
+            nonce TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(username) REFERENCES users(username)
+        );
+
+        CREATE TABLE IF NOT EXISTS certificates (
+            serial_number TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            certificate_pem TEXT NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            FOREIGN KEY(username) REFERENCES users(username)
+        );
+
+        CREATE TABLE IF NOT EXISTS certificate_revocation (
+            serial_number TEXT PRIMARY KEY,
+            revoked_at TEXT NOT NULL,
+            revoked_by TEXT NOT NULL,
+            reason TEXT
+        );
         """
     )
-    conn.execute("""
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS upload_sessions (
             id TEXT PRIMARY KEY,
             owner TEXT NOT NULL,
@@ -294,27 +399,129 @@ def db() -> sqlite3.Connection:
         );
         """
     )
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(shares)").fetchall()}
-    if "permission" not in columns:
-        conn.execute("ALTER TABLE shares ADD COLUMN permission TEXT NOT NULL DEFAULT 'viewer'")
-        conn.execute("UPDATE shares SET permission='owner' WHERE recipient=owner")
-        conn.commit()
-    return conn
 
+    # ==========================================================
+    # SHARES MIGRATION
+    # ==========================================================
+
+    share_columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(shares)"
+        ).fetchall()
+    }
+
+    if "permission" not in share_columns:
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN permission TEXT NOT NULL DEFAULT 'viewer'"
+        )
+        conn.execute(
+            "UPDATE shares SET permission='owner' WHERE recipient=owner"
+        )
+
+    # ==========================================================
+    # USERS MIGRATION
+    # ==========================================================
+
+    user_columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(users)"
+        ).fetchall()
+    }
+
+    user_migrations = [
+
+        (
+            "nip",
+            "ALTER TABLE users ADD COLUMN nip TEXT NOT NULL DEFAULT ''"
+        ),
+
+        (
+            "rank",
+            "ALTER TABLE users ADD COLUMN rank TEXT NOT NULL DEFAULT ''"
+        ),
+
+        (
+            "position",
+            "ALTER TABLE users ADD COLUMN position TEXT NOT NULL DEFAULT ''"
+        ),
+
+        (
+            "pki_public_key",
+            "ALTER TABLE users ADD COLUMN pki_public_key TEXT"
+        ),
+
+        (
+            "account_status",
+            "ALTER TABLE users ADD COLUMN account_status TEXT NOT NULL DEFAULT 'PENDING'"
+        ),
+
+        (
+            "certificate_status",
+            "ALTER TABLE users ADD COLUMN certificate_status TEXT NOT NULL DEFAULT 'NONE'"
+        ),
+
+        (
+            "approved_at",
+            "ALTER TABLE users ADD COLUMN approved_at TEXT"
+        ),
+
+        (
+            "approved_by",
+            "ALTER TABLE users ADD COLUMN approved_by TEXT"
+        ),
+
+        (
+            "revoked_at",
+            "ALTER TABLE users ADD COLUMN revoked_at TEXT"
+        ),
+
+        (
+            "revoked_by",
+            "ALTER TABLE users ADD COLUMN revoked_by TEXT"
+        ),
+
+        (
+            "deleted_at",
+            "ALTER TABLE users ADD COLUMN deleted_at TEXT"
+        ),
+
+        (
+            "deleted_by",
+            "ALTER TABLE users ADD COLUMN deleted_by TEXT"
+        )
+
+    ]
+
+    for column_name, sql in user_migrations:
+
+        if column_name not in user_columns:
+
+            conn.execute(sql)
+
+    conn.commit()
+
+    return conn
 
 def current_user(authorization: str | None = Header(default=None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Login diperlukan.")
     return verify_token(authorization.removeprefix("Bearer ").strip())
 
-
 class RegisterIn(BaseModel):
-    username: str = Field(min_length=3, max_length=32, pattern=r"^[a-zA-Z0-9_.-]+$")
-    display_name: str = Field(min_length=1, max_length=80)
-    password: str = Field(min_length=8, max_length=256)
+
+    username: str
+    display_name: str
+    password: str
+    # Identitas Personel
+    nip: str
+    rank: str
+    position: str
+    # DIPP
     public_key: dict
-
-
+    # PKI
+    pki_public_key: str
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -324,6 +531,9 @@ class FileUploadIn(BaseModel):
     filename: str = Field(min_length=1, max_length=240)
     envelope: dict
     wrapped_key_for_owner: dict
+
+class CertificateChallengeOut(BaseModel):
+    nonce: str
 
 
 class ShareIn(BaseModel):
@@ -363,6 +573,12 @@ class FileUpdateIn(BaseModel):
 class FileRenameIn(BaseModel):
     filename: str = Field(min_length=1, max_length=240)
 
+class CertificateRequestIn(BaseModel):
+    nonce: str
+    signature: str
+
+class CertificateIssueIn(BaseModel):
+    request_id: int
 
 app = FastAPI(title="ONE_MIND", version="2.0")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
@@ -405,18 +621,76 @@ def health():
 
 @app.post("/api/register")
 def register(data: RegisterIn):
+
     conn = db()
+
     try:
+
         conn.execute(
-            "INSERT INTO users (username, display_name, password_hash, public_key, created_at) VALUES (?, ?, ?, ?, ?)",
-            (data.username, data.display_name, hash_password(data.password), json.dumps(data.public_key), now_iso()),
+            """
+            INSERT INTO users
+            (
+                username,
+                display_name,
+                password_hash,
+
+                nip,
+                rank,
+                position,
+
+                public_key,
+                pki_public_key,
+
+                account_status,
+                certificate_status,
+
+                created_at
+            )
+            VALUES
+            (
+                ?, ?, ?,
+                ?, ?, ?,
+                ?, ?,
+                ?, ?,
+                ?
+            )
+            """,
+            (
+                data.username,
+                data.display_name,
+                hash_password(data.password),
+
+                data.nip,
+                data.rank,
+                data.position,
+
+                json.dumps(data.public_key),
+                data.pki_public_key,
+
+                "PENDING",
+                "NONE",
+
+                now_iso(),
+            ),
         )
+
         conn.commit()
+
     except sqlite3.IntegrityError as exc:
-        raise HTTPException(status_code=409, detail="Username sudah dipakai.") from exc
+
+        raise HTTPException(
+            status_code=409,
+            detail="Username sudah dipakai."
+        ) from exc
+
     finally:
+
         conn.close()
-    return {"token": sign_token(data.username), "username": data.username}
+
+    return {
+        "token": sign_token(data.username),
+        "username": data.username,
+    }
 
 
 @app.post("/api/login")
@@ -431,6 +705,156 @@ def login(data: LoginIn, request: Request):
     clear_login_failures(rate_key)
     return {"token": sign_token(data.username), "username": data.username}
 
+@app.get("/api/certificate/requests")
+def certificate_requests(username: str = Depends(current_user)):
+
+    conn = db()
+
+    rows = conn.execute(
+        """
+        SELECT
+            id,
+            username,
+            status,
+            created_at
+        FROM certificate_requests
+        ORDER BY created_at DESC
+        """
+    ).fetchall()
+
+    conn.close()
+
+    return [
+        {
+            "id": row["id"],
+            "username": row["username"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+@app.post("/api/certificate/issue")
+def certificate_issue(
+    data: CertificateIssueIn,
+    username: str = Depends(current_user),
+):
+    conn = db()
+
+    req = conn.execute(
+        """
+        SELECT *
+        FROM certificate_requests
+        WHERE id=?
+        """,
+        (data.request_id,),
+    ).fetchone()
+
+    if not req:
+        conn.close()
+        raise HTTPException(
+            status_code=404,
+            detail="CSR tidak ditemukan."
+        )
+
+    if req["status"] != "PENDING":
+        conn.close()
+        raise HTTPException(
+            status_code=400,
+            detail="CSR sudah diproses."
+        )
+
+    # ===================================================
+    # Issue Certificate
+    # ===================================================
+    existing = conn.execute(
+        """
+        SELECT id
+        FROM certificates
+        WHERE username=?
+        AND status='ACTIVE'
+        """,
+        (
+            req["username"],
+        ),
+    ).fetchone()
+
+    if existing:
+        conn.close()
+        raise HTTPException(
+            status_code=400,
+            detail="User sudah memiliki certificate aktif."
+        )
+    # ===================================================
+    # Simpan CSR ke file sementara
+    # karena engine PKI bekerja berbasis file
+    # ===================================================
+
+    csr_path = Path(__file__).parent / "pki" / "csr" / f"{req['username']}.csr"
+    
+    csr_path.write_text(
+        req["csr_pem"],
+        encoding="utf-8"
+    )
+
+    # ===================================================
+    # Issue Certificate
+    # ===================================================
+
+    cert_path = issue_certificate(
+        req["username"]
+    )
+
+    certificate_pem = Path(cert_path).read_text(
+        encoding="utf-8"
+    )
+
+    cert = x509.load_pem_x509_certificate(
+    certificate_pem.encode("utf-8")
+    )
+
+    conn.execute(
+        """
+        INSERT INTO certificates
+        (
+            serial_number,
+            username,
+            certificate_pem,
+            issued_at,
+            expires_at,
+            status
+        )
+        VALUES
+        (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            format(cert.serial_number, "X"),
+            req["username"],
+            certificate_pem,
+            cert.not_valid_before_utc.isoformat(),
+            cert.not_valid_after_utc.isoformat(),
+            "ACTIVE",
+        ),
+    )
+    conn.execute(
+        """
+        UPDATE certificate_requests
+        SET status='ISSUED'
+        WHERE id=?
+        """,
+        (
+            data.request_id,
+        ),
+    )
+
+    conn.commit()
+
+    conn.close()
+
+    return {
+        "ok": True,
+        "message": "Certificate berhasil diterbitkan."
+    }
 
 @app.get("/api/me")
 def me(username: str = Depends(current_user)):
@@ -468,6 +892,185 @@ def user_public_key(target_username: str, username: str = Depends(current_user))
     if not row:
         raise HTTPException(status_code=404, detail="User tidak ditemukan.")
     return {"username": row["username"], "display_name": row["display_name"], "public_key": json.loads(row["public_key"])}
+
+@app.get(
+    "/api/certificate/challenge",
+    response_model=CertificateChallengeOut
+)
+def certificate_challenge(
+    username: str = Depends(current_user),
+):
+
+    conn = db()
+
+    nonce = secrets.token_hex(32)
+
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO certificate_challenges
+        (
+            username,
+            nonce,
+            created_at
+        )
+        VALUES
+        (?, ?, ?)
+        """,
+        (
+            username,
+            nonce,
+            now_iso(),
+        ),
+    )
+
+    conn.commit()
+
+    conn.close()
+
+    return {
+        "nonce": nonce
+    }
+
+@app.post("/api/certificate/request")
+def certificate_request(
+    data: CertificateRequestIn,
+    username: str = Depends(current_user),
+):
+
+    conn = db()
+
+    # =====================================
+    # Ambil challenge milik user
+    # =====================================
+
+    row = conn.execute(
+        """
+        SELECT nonce
+        FROM certificate_challenges
+        WHERE username=?
+        """,
+        (
+            username,
+        ),
+    ).fetchone()
+
+    if not row:
+
+        conn.close()
+
+        raise HTTPException(
+            status_code=400,
+            detail="Challenge tidak ditemukan."
+        )
+
+    # =====================================
+    # Pastikan nonce cocok
+    # =====================================
+
+    if row["nonce"] != data.nonce:
+
+        conn.close()
+
+        raise HTTPException(
+            status_code=400,
+            detail="Challenge tidak valid."
+        )
+
+    # =====================================
+    # Ambil PKI Public Key User
+    # =====================================
+
+    user = conn.execute(
+        """
+        SELECT pki_public_key
+        FROM users
+        WHERE username=?
+        """,
+        (
+            username,
+        ),
+    ).fetchone()
+
+    if not user:
+
+        conn.close()
+
+        raise HTTPException(
+            status_code=404,
+            detail="User tidak ditemukan."
+        )
+
+    if not user["pki_public_key"]:
+
+        conn.close()
+
+        raise HTTPException(
+            status_code=400,
+            detail="PKI Public Key belum terdaftar."
+        )
+
+    # =====================================
+    # Verify RSA Signature
+    # =====================================
+
+    if not verify_pki_signature(
+        user["pki_public_key"],
+        data.nonce,
+        data.signature,
+    ):
+
+        conn.close()
+
+        raise HTTPException(
+            status_code=401,
+            detail="Signature tidak valid."
+        )
+
+    # =====================================
+    # Simpan Certificate Request
+    # =====================================
+
+    conn.execute(
+        """
+        INSERT INTO certificate_requests
+        (
+            username,
+            csr_pem,
+            status,
+            requested_at
+        )
+        VALUES
+        (?, ?, 'PENDING', ?)
+        """,
+        (
+            username,
+            "PROOF_OF_POSSESSION_OK",
+            now_iso(),
+        ),
+    )
+
+    # =====================================
+    # Hapus challenge (anti replay)
+    # =====================================
+
+    conn.execute(
+        """
+        DELETE FROM certificate_challenges
+        WHERE username=?
+        """,
+        (
+            username,
+        ),
+    )
+
+    conn.commit()
+
+    conn.close()
+
+    return {
+        "ok": True,
+        "message": "Proof of Possession berhasil diverifikasi."
+    }
 
 @app.post("/api/upload/start")
 def upload_start(
@@ -684,7 +1287,7 @@ def upload_finish(
             )
 
         # ====================================================
-        # INTEGRITY CHECK (BARU)
+        # INTEGRITY CHECK
         # ====================================================
 
         server_sha256 = base64.b64encode(
@@ -704,6 +1307,18 @@ def upload_finish(
         file_id = new_id()
 
         envelope = data.envelope.copy()
+
+        # ====================================================
+        # Metadata Identitas File
+        # ====================================================
+
+        envelope["file_id"] = file_id
+        envelope["version"] = 1
+        envelope["uploaded_at"] = now_iso()
+
+        # ====================================================
+        # Ciphertext
+        # ====================================================
 
         envelope["ciphertext_b64"] = base64.b64encode(
             merged_bytes
@@ -811,22 +1426,58 @@ def upload_finish(
     }
 
 @app.get("/api/files")
-def list_files(username: str = Depends(current_user)):
+def list_files(username: str =Depends(current_user)):
+
     conn = db()
+
     rows = conn.execute(
         """
-        SELECT f.id, f.owner, f.filename, f.encrypted_size, f.created_at, s.permission
+        SELECT
+            f.id,
+            f.owner,
+            f.filename,
+            f.encrypted_size,
+            f.created_at,
+            f.envelope_name,
+            s.permission
         FROM files f
-        JOIN shares s ON s.file_id = f.id
+        JOIN shares s
+            ON s.file_id = f.id
         WHERE s.recipient = ?
         GROUP BY f.id
         ORDER BY f.created_at DESC
         """,
-        (username,),
+        (username,)
     ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
 
+    result = []
+
+    for row in rows:
+
+        item = dict(row)
+
+        try:
+
+            env_path = envelope_path(
+                row["id"],
+                create_dir=False
+            )
+
+            item["envelope"] = json.loads(
+                env_path.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        except Exception:
+
+            item["envelope"] = {}
+
+        result.append(item)
+
+    conn.close()
+
+    return result
 
 @app.get("/api/files/{file_id}")
 def download_file(file_id: str, username: str = Depends(current_user)):
@@ -906,38 +1557,85 @@ def rename_file(file_id: str, data: FileRenameIn, username: str = Depends(curren
 @app.put("/api/files/{file_id}")
 def update_file(file_id: str, data: FileUpdateIn, username: str = Depends(current_user)):
     conn = db()
+
     require_file_permission(conn, file_id, username, {"owner", "editor"})
+
     expected_recipients = access_usernames(conn, file_id)
     submitted_recipients = {item.recipient for item in data.wrapped_keys}
+
     if submitted_recipients != expected_recipients:
         conn.close()
         raise HTTPException(
             status_code=400,
             detail="Wrapped key harus dibuat ulang untuk semua user yang masih punya akses.",
         )
-    row = conn.execute("SELECT id FROM files WHERE id=?", (file_id,)).fetchone()
+
+    row = conn.execute(
+        "SELECT id FROM files WHERE id=?",
+        (file_id,)
+    ).fetchone()
+
     if not row:
         conn.close()
-        raise HTTPException(status_code=404, detail="File tidak ditemukan.")
+        raise HTTPException(
+            status_code=404,
+            detail="File tidak ditemukan."
+        )
+
+    # ==========================================
+    # DEBUG
+    # ==========================================
+
+    print("\n========== UPDATE BACKEND ==========")
+    print("Envelope type:", type(data.envelope))
+    print("Envelope keys:", list(data.envelope.keys()))
+    print("Has ciphertext:", "ciphertext_b64" in data.envelope)
+
+    if "ciphertext_b64" in data.envelope:
+        print(
+            "Cipher length:",
+            len(data.envelope["ciphertext_b64"])
+        )
+
+    print("====================================\n")
+
+    # ==========================================
+
     envelope_bytes = json.dumps(
         data.envelope,
         ensure_ascii=False,
         separators=(",", ":")
     ).encode("utf-8")
-    envelope_path(file_id).write_bytes(envelope_bytes)
+
+    envelope_path(file_id).write_bytes(
+        envelope_bytes
+    )
+
     conn.execute(
         "UPDATE files SET filename=?, encrypted_size=? WHERE id=?",
-        (data.filename, len(envelope_bytes), file_id),
+        (
+            data.filename,
+            len(envelope_bytes),
+            file_id,
+        ),
     )
+
     for item in data.wrapped_keys:
         conn.execute(
             "UPDATE shares SET wrapped_key=? WHERE file_id=? AND recipient=?",
-            (json.dumps(item.wrapped_key), file_id, item.recipient),
+            (
+                json.dumps(item.wrapped_key),
+                file_id,
+                item.recipient,
+            ),
         )
+
     conn.commit()
     conn.close()
-    return {"ok": True}
 
+    return {
+        "ok": True
+    }
 
 @app.delete("/api/files/{file_id}")
 def delete_file(file_id: str, username: str = Depends(current_user)):

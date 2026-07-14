@@ -30,15 +30,14 @@
         <div class="warningBox">
 
           <strong>
-            Identitas DIPP akan dibuat dan diunduh ke komputer Anda.
+            ONE_MIND Identity akan dibuat dan diunduh ke komputer Anda.
           </strong>
 
           <p>
-            Server <b>tidak pernah menyimpan Private Key DIPP</b>.
-            Setelah registrasi selesai, browser akan otomatis mengunduh
-            file <b>Identitas DIPP (.dipp)</b>.
-            Simpan file tersebut di tempat yang aman karena diperlukan
-            untuk membuka file yang Anda miliki di kemudian hari.
+            Server <b>tidak pernah menyimpan Private Key DIPP maupun PKI</b>.
+            Setelah registrasi selesai browser akan mengunduh
+            <b>ONE_MIND Identity (.omid)</b>.
+            Simpan file tersebut karena diperlukan untuk login dan membuka data.
           </p>
 
         </div>
@@ -53,9 +52,30 @@
         </label>
 
         <label>
-          Nama Tampilan
+          Nama Lengkap
           <input
             name="display_name"
+            required>
+        </label>
+
+        <label>
+          NIP
+          <input
+            name="nip"
+            required>
+        </label>
+
+        <label>
+          Pangkat
+          <input
+            name="rank"
+            required>
+        </label>
+
+        <label>
+          Jabatan
+          <input
+            name="position"
             required>
         </label>
 
@@ -71,7 +91,7 @@
 
         <button type="submit">
 
-          Buat Akun & Unduh Identitas DIPP
+          Buat Akun & Unduh ONE_MIND Identity
 
         </button>
 
@@ -345,6 +365,6 @@
     <section id="notice" class="notice hidden"></section>
     <input id="updateFileInput" class="hidden" type="file">
   </main>
-  <script src="/static/app.js?v=20260707-session1"></script>
+  <script src="/static/app.js?v=20260714-pki1"></script>
 </body>
 </html>
