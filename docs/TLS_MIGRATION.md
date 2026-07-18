@@ -1,97 +1,47 @@
-# Manual Migrasi TLS: Self-Signed ke Let's Encrypt / Reverse Proxy
+# Deployment TLS ONE_MIND
 
-Dokumen ini menjelaskan cara memindahkan ONE_MIND dari sertifikat lokal self-signed ke setup profesional memakai reverse proxy dan sertifikat valid, terutama Caddy + Let's Encrypt.
+Dokumen ini mengikuti konfigurasi Docker dan Caddy yang ada pada repository per 18 Juli 2026.
 
-## 1. Kondisi Saat Ini
+## Dua Mode Deployment
 
-Mode default lokal memakai:
+### Lokal atau intranet langsung
 
-- container `one_mind`;
-- Uvicorn HTTPS langsung di port `8443`;
-- sertifikat self-signed di volume `one_mind_certs`;
-- akses: `https://localhost:8443`.
+`docker-compose.yml` menjalankan aplikasi pada `0.0.0.0:8443`. Uvicorn memuat:
 
-Mode ini cocok untuk development, demo lokal, atau intranet kecil yang menerima warning sertifikat.
+- `/app/certs/server.crt`
+- `/app/certs/server.key`
 
-## 2. Target Produksi
+Direktori host yang dipasang:
 
-Mode produksi yang disiapkan:
+- `./data:/app/data`
+- `./certs:/app/certs`
 
-```text
-Browser
-  |
-  | HTTPS valid dari Let's Encrypt
-  v
-Caddy reverse proxy
-  |
-  | HTTP internal Docker network
-  v
-ONE_MIND FastAPI container
-```
+Jika certificate/key tidak ada, `scripts/entrypoint.sh` menjalankan generator sertifikat self-signed. Akses melalui `https://hostname:8443`.
 
-Pada mode ini:
+### Produksi dengan Caddy
 
-- Caddy membuka port `80` dan `443`;
-- Caddy otomatis meminta dan memperpanjang sertifikat Let's Encrypt;
-- aplikasi ONE_MIND berjalan HTTP internal di port `8080`;
-- TLS tidak lagi ditangani Uvicorn;
-- data tetap di volume `one_mind_data`.
+`docker-compose.prod.yml` menjalankan:
 
-## 3. File yang Disediakan
+- aplikasi HTTP internal pada port `8080`;
+- Caddy pada port host `80` dan `443`;
+- reverse proxy dari domain publik ke `one-mind:8080`.
 
-File baru:
+Uvicorn tidak memakai TLS pada jaringan Docker; Caddy menangani certificate dan HTTPS.
 
-- `docker-compose.prod.yml`: compose produksi dengan Caddy.
-- `deploy/Caddyfile`: konfigurasi reverse proxy dan TLS.
-- `.env.production.example`: template variabel produksi.
+## Persyaratan Produksi
 
-Entrypoint aplikasi mendukung:
+1. Domain mengarah ke IP server.
+2. Port 80 dan 443 dapat dicapai Caddy untuk challenge ACME dan trafik HTTPS.
+3. Docker/Compose tersedia.
+4. DNS, firewall, NAT, dan clock server benar.
+5. Email ACME valid.
+6. Secret dan data runtime sudah dikeluarkan dari repository.
 
-- `ONE_MIND_TLS_MODE=internal`: Uvicorn pakai sertifikat internal/self-signed.
-- `ONE_MIND_TLS_MODE=off`: Uvicorn HTTP internal untuk reverse proxy TLS.
+## Konfigurasi Environment
 
-## 4. Prasyarat Let's Encrypt
+Buat `.env` berdasarkan `.env.production.example`:
 
-Untuk sertifikat Let's Encrypt publik:
-
-1. Punya domain, misalnya `drive.example.com`.
-2. DNS `A` record domain mengarah ke IP server.
-3. Port `80/tcp` dan `443/tcp` terbuka dari internet ke server.
-4. Tidak ada service lain yang memakai port 80/443.
-5. Server bisa akses internet untuk ACME challenge.
-
-Jika hanya intranet tertutup tanpa akses internet, gunakan salah satu:
-
-- internal CA perusahaan;
-- DNS-01 challenge dengan provider DNS yang didukung Caddy;
-- sertifikat manual dari CA internal;
-- tetap self-signed, tapi distribusikan root CA ke perangkat user.
-
-## 5. Migrasi dari Local Self-Signed ke Caddy + Let's Encrypt
-
-### 5.1 Backup Dulu
-
-Sebelum migrasi:
-
-```powershell
-docker compose stop
-docker run --rm --volumes-from one_mind -v "${PWD}:/backup" alpine tar czf /backup/one_mind_before_tls_migration.tar.gz /app/data /app/certs
-docker compose up -d
-```
-
-Yang paling penting adalah `/app/data`.
-
-### 5.2 Siapkan `.env.production`
-
-Copy template:
-
-```powershell
-Copy-Item .env.production.example .env.production
-```
-
-Edit:
-
-```text
+```dotenv
 ONE_MIND_DOMAIN=drive.example.com
 LETSENCRYPT_EMAIL=admin@example.com
 ONE_MIND_ALLOWED_HOSTS=drive.example.com
@@ -100,173 +50,87 @@ ONE_MIND_LOGIN_MAX_FAILURES=8
 ONE_MIND_LOGIN_WINDOW_SECONDS=600
 ```
 
-Untuk Linux:
+Jangan memakai `ONE_MIND_ALLOWED_HOSTS=*` pada produksi. Jika aplikasi harus menerima beberapa hostname, gunakan daftar yang memang diperlukan.
+
+## Menjalankan Produksi
 
 ```bash
-cp .env.production.example .env.production
+docker compose -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.prod.yml ps
+docker compose -f docker-compose.prod.yml logs -f caddy
+docker compose -f docker-compose.prod.yml logs -f one-mind
 ```
 
-### 5.3 Jalankan Compose Produksi
-
-Stop mode lokal:
-
-```powershell
-docker compose down
-```
-
-Jalankan mode produksi:
-
-```powershell
-docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
-```
-
-Caddy akan:
-
-- menerima request HTTP/HTTPS;
-- meminta sertifikat Let's Encrypt;
-- meneruskan traffic ke `one-mind:8080`.
-
-### 5.4 Verifikasi
-
-Cek container:
-
-```powershell
-docker compose --env-file .env.production -f docker-compose.prod.yml ps
-```
-
-Cek log Caddy:
-
-```powershell
-docker compose --env-file .env.production -f docker-compose.prod.yml logs -f caddy
-```
-
-Buka:
-
-```text
-https://drive.example.com
-```
-
-Browser harus menampilkan sertifikat valid tanpa warning.
-
-## 6. Migrasi Data
-
-Migrasi TLS tidak perlu mengubah data aplikasi.
-
-Yang tetap dipakai:
-
-- `one_mind_data`: database, envelope file, server secret.
-
-Yang tidak wajib dipakai di mode Caddy:
-
-- `one_mind_certs`: sertifikat self-signed lama.
-
-Jika pindah server sekaligus, pindahkan volume data:
-
-```powershell
-docker compose stop
-docker run --rm --volumes-from one_mind -v "${PWD}:/backup" alpine tar czf /backup/one_mind_data.tar.gz /app/data
-```
-
-Restore di server baru:
+Uji:
 
 ```bash
-docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
-docker compose --env-file .env.production -f docker-compose.prod.yml stop one-mind
-docker run --rm --volumes-from one_mind -v "$PWD:/backup" alpine sh -c "cd / && tar xzf /backup/one_mind_data.tar.gz"
-docker compose --env-file .env.production -f docker-compose.prod.yml up -d
+curl -I https://drive.example.com/
+curl https://drive.example.com/health
 ```
 
-## 7. Rollback ke Mode Lokal
+Respons `/health` seharusnya berisi `{"ok":true}`. Pastikan certificate sesuai domain dan tidak ada mixed content.
 
-Jika produksi gagal:
+## Header dan Proxy
 
-```powershell
-docker compose --env-file .env.production -f docker-compose.prod.yml down
-docker compose up -d --build
-```
+Caddy menambahkan HSTS, `nosniff`, frame denial, referrer policy, dan permissions policy. Backend juga menambahkan CSP serta security header. Caddy meneruskan informasi skema sehingga backend dapat memberikan HSTS.
 
-Buka lagi:
+Jangan mengekspos port `8080` aplikasi ke internet. Pada compose produksi port tersebut hanya menggunakan `expose`, bukan mapping host.
 
-```text
-https://localhost:8443
-```
+## Penyimpanan Produksi
 
-Data tetap aman selama tidak menjalankan `docker compose down -v`.
+Compose produksi memakai named volume:
 
-## 8. Catatan Reverse Proxy Lain
+- `one_mind_data`: database, storage envelope/ciphertext, upload temporary data, dan server secret;
+- `caddy_data`: certificate dan state ACME;
+- `caddy_config`: konfigurasi runtime Caddy.
 
-### 8.1 Nginx
+Backup harus mencakup ketiga volume sesuai kebutuhan pemulihan. Backup harus terenkripsi, diuji restore-nya, dan dipisahkan dari host utama.
 
-Jika memakai Nginx, konsepnya sama:
+Private key pengguna tidak ada di volume server menurut implementasi aplikasi; pengguna harus menjaga file DIPP/RSA export masing-masing. Saat ini file export tersebut belum dienkripsi oleh aplikasi.
 
-- Nginx terminasi TLS di port 443;
-- Nginx proxy ke aplikasi HTTP internal;
-- set `ONE_MIND_TLS_MODE=off`;
-- set `ONE_MIND_PORT=8080`;
-- pastikan header `X-Forwarded-Proto: https` dikirim.
+## Migrasi dari Mode Lokal
 
-Contoh prinsip:
+1. Hentikan perubahan data atau buat maintenance window.
+2. Backup `./data` dan `./certs` secara aman.
+3. Audit isi repository dan rotasi secret yang pernah dibagikan.
+4. Salin isi data yang diperlukan ke volume `one_mind_data`.
+5. Atur domain dan allowed hosts.
+6. Jalankan compose produksi.
+7. Uji setup/login admin, approval akun, login RSA challenge, certificate, upload chunk, download, share, revoke, update/rotate, dan delete.
+8. Verifikasi backup/restore.
 
-```nginx
-location / {
-    proxy_pass http://one-mind:8080;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-Proto https;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-}
-```
+Certificate self-signed lokal tidak perlu dipakai Caddy. Jangan menyalin TLS private key development ke deployment publik tanpa alasan dan prosedur rotasi yang jelas.
 
-### 8.2 Traefik
+## Deployment Intranet
 
-Jika memakai Traefik:
+Pilihan yang disarankan:
 
-- jalankan ONE_MIND dengan `ONE_MIND_TLS_MODE=off`;
-- publish service internal port `8080`;
-- atur router TLS dan resolver ACME di Traefik.
+- gunakan CA internal dan certificate yang dipercaya seluruh perangkat organisasi; atau
+- gunakan reverse proxy internal dengan certificate perusahaan.
 
-## 9. Checklist Produksi TLS
+Jika tetap memakai self-signed, distribusikan trust anchor melalui mekanisme administrasi perangkat. Jangan melatih pengguna melewati warning certificate untuk server produksi karena kebiasaan tersebut melemahkan deteksi serangan man-in-the-middle.
 
-- DNS domain sudah mengarah ke server.
-- Port 80 dan 443 terbuka.
-- `.env.production` sudah benar.
-- `ONE_MIND_ALLOWED_HOSTS` tidak memakai `*`.
-- Caddy berhasil mendapatkan sertifikat.
-- Browser tidak menampilkan warning sertifikat.
-- Login, upload, download, share, search, dan rotate key diuji.
-- Backup `one_mind_data` sudah dijadwalkan.
-- User sudah diberi SOP export/import encrypted private key.
+Batasi akses dengan firewall/VPN, gunakan hostname tetap, dan set `ONE_MIND_ALLOWED_HOSTS` secara eksplisit.
 
-## 10. Kesalahan Umum
+## Rotasi Certificate dan Secret
 
-### Sertifikat Let's Encrypt gagal dibuat
+- Certificate Caddy umumnya diperbarui otomatis melalui ACME.
+- Backup `caddy_data` tetap sensitif karena memuat private key.
+- Perubahan `server_secret.bin` membuat seluruh bearer token lama tidak valid.
+- Jika root/intermediate CA atau TLS key dalam repo pernah terekspos, lakukan revokasi/rotasi; jangan hanya menghapus filenya.
 
-Kemungkinan:
+## Checklist Sebelum Internet
 
-- DNS belum mengarah ke server;
-- port 80/443 tertutup;
-- domain masih dipakai reverse proxy lain;
-- rate limit Let's Encrypt.
+- [ ] Domain dan TLS tervalidasi.
+- [ ] Port backend internal tidak terbuka publik.
+- [ ] Allowed hosts tidak memakai wildcard.
+- [ ] Secret/data aktif tidak terlacak Git.
+- [ ] Seluruh key historis yang terekspos sudah dirotasi.
+- [ ] Backup terenkripsi dan restore diuji.
+- [ ] Monitoring, alert, log retention, dan time synchronization tersedia.
+- [ ] Rate limiting eksternal/WAF disiapkan.
+- [ ] Batas upload dan kuota ditetapkan.
+- [ ] Export private key sudah dienkripsi.
+- [ ] Audit aplikasi dan kriptografi selesai.
 
-### Aplikasi menolak host
-
-Kemungkinan:
-
-- `ONE_MIND_ALLOWED_HOSTS` belum berisi domain produksi.
-
-Solusi:
-
-```text
-ONE_MIND_ALLOWED_HOSTS=drive.example.com
-```
-
-Lalu restart compose produksi.
-
-### Browser masih membuka localhost
-
-Gunakan URL domain produksi:
-
-```text
-https://drive.example.com
-```
-
-Jangan gunakan `https://localhost:8443` saat mode produksi Caddy.
+TLS hanya melindungi data saat transit. TLS tidak membuat implementasi prototipe otomatis aman untuk data sensitif dan tidak melindungi pengguna dari server yang menyajikan JavaScript berbahaya.

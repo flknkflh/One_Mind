@@ -1,137 +1,144 @@
 # ONE_MIND
 
-ONE_MIND adalah prototype drive terenkripsi yang disatukan menjadi satu aplikasi web lokal. Aplikasi dijalankan dengan Docker, memakai HTTPS/TLS untuk transport, dan memakai enkripsi end-to-end di browser untuk isi file serta kunci file.
+ONE_MIND adalah prototipe web drive terenkripsi. Isi file dienkripsi dan didekripsi di browser, sedangkan server menyimpan ciphertext, metadata, public key, wrapped file key, status akun, dan sertifikat pengguna.
 
-Dokumentasi lengkap tersedia di [docs/MANUAL_BOOK.md](docs/MANUAL_BOOK.md). Manual migrasi sertifikat ke Let's Encrypt/reverse proxy tersedia di [docs/TLS_MIGRATION.md](docs/TLS_MIGRATION.md).
+Dokumentasi:
 
-## Jalankan Lokal
+- [Manual sistem](docs/MANUAL_BOOK.md)
+- [Catatan keamanan](docs/SECURITY.md)
+- [Panduan TLS dan deployment](docs/TLS_MIGRATION.md)
+- [Konteks implementasi](Prompt.md)
 
-```powershell
+> Status dokumentasi: diselaraskan dengan kode repository pada 18 Juli 2026. Implementasi saat ini berbeda dari rancangan lama yang menyimpan private key terenkripsi di `localStorage`.
+
+## Menjalankan Secara Lokal
+
+Persyaratan: Docker dan Docker Compose.
+
+```bash
 docker compose up --build
 ```
 
-Buka:
+Buka `https://localhost:8443`. Mode lokal memakai sertifikat self-signed sehingga browser dapat menampilkan peringatan.
 
-```text
-https://localhost:8443
-```
+Data lokal dipasang dari:
 
-Browser akan memberi peringatan karena sertifikat lokal dibuat self-signed. Untuk pengujian lokal, lanjutkan ke halaman tersebut. Sertifikat berada di volume Docker `one_mind_certs`.
+- `./data` ke `/app/data`
+- `./certs` ke `/app/certs`
 
-## Alur Pakai
+Konfigurasi utama tersedia melalui `ONE_MIND_ALLOWED_HOSTS`, `ONE_MIND_SESSION_SECONDS`, `ONE_MIND_LOGIN_MAX_FAILURES`, dan `ONE_MIND_LOGIN_WINDOW_SECONDS`.
 
-1. Daftar akun.
-   Browser membuat keypair DIPP-KEM. Public key DIPP dikirim ke server, private key DIPP disimpan lokal di browser dalam bentuk terenkripsi password.
+## Alur Sistem Saat Ini
 
-2. Upload file.
-   Browser membuat AES-256-GCM key acak, mengenkripsi file, lalu upload envelope terenkripsi ke server.
+### 1. Inisialisasi administrator
 
-3. Bagikan file.
-   Pemilik membuka kunci file lokal, lalu browser membungkus kunci file untuk public key DIPP penerima memakai metode DIPP.
+Administrator pertama dibuat melalui UI/API setup. Sesudah itu administrator dapat login, menyetujui atau menolak registrasi, mencabut/memulihkan akun, mengubah data akun, melakukan soft-delete, dan mengganti password admin.
 
-4. Download file.
-   Penerima mengunduh envelope terenkripsi dan wrapped key, membuka wrapped key dengan private key lokal, lalu dekripsi file di browser.
+### 2. Registrasi pengguna
 
-## Properti Keamanan
+Browser membuat dua identitas:
 
-- Transport layer memakai HTTPS/TLS via Uvicorn SSL.
-- Server menyimpan file dalam bentuk ciphertext saja.
-- Server menyimpan public key pengguna, metadata file, dan wrapped key.
-- Server tidak menyimpan private key pengguna.
-- Server tidak menerima plaintext file atau raw AES file key.
-- Enkripsi asimetrik/key wrapping memakai DIPP-KEM dari prototype kamu, dipakai untuk membungkus AES file key per penerima.
-- Password akun masih dikirim ke server lewat TLS untuk autentikasi. Jika nanti ingin zero-knowledge login penuh, ubah autentikasi ke PAKE/SRP/OPAQUE atau certificate challenge-response.
+- keypair DIPP untuk membungkus AES file key;
+- keypair RSA 4096-bit untuk proof-of-possession saat login.
 
-## Data Persisten
+Server menerima data identitas, DIPP public key, RSA public key, serta password melalui HTTPS. Password disimpan sebagai hash PBKDF2-SHA-256. Akun baru berstatus `PENDING` sampai diproses administrator.
 
-Docker Compose memakai volume:
+Browser mengekspor dua file identitas pengguna. Pada implementasi saat ini, private key di dalam file tersebut **belum dienkripsi dengan password**. File harus diperlakukan sebagai secret berisiko tinggi.
 
-- `one_mind_data`: SQLite database, encrypted envelopes, server secret.
-- `one_mind_certs`: sertifikat dan private key TLS lokal.
+### 3. Login
 
-Reset total lokal:
+Login memiliki dua tahap:
 
-```powershell
-docker compose down -v
-```
+1. Server memeriksa username, password, dan status akun lalu memberikan pending-login token.
+2. Browser mengimpor RSA Login Key, meminta nonce, menandatangani nonce, dan server memverifikasi signature dengan RSA public key pengguna.
 
-Perintah ini menghapus database, storage, dan sertifikat lokal.
+Setelah verifikasi berhasil, server menerbitkan bearer token utama. Saat login pertama yang valid, certificate pengguna diterbitkan otomatis jika belum ada.
 
-## Backup Kunci User
+Bearer token dan username disimpan di `localStorage`. DIPP/RSA private key tidak disimpan di `localStorage`; key yang diimpor hidup di RAM tab.
 
-Private key user disimpan di browser, bukan di server. Untuk pindah browser/perangkat:
+### 4. Upload
 
-1. Login di browser lama.
-2. Buka tab **Kunci Lokal**.
-3. Klik **Export encrypted private key**.
-4. Buat password backup khusus minimal 12 karakter.
-5. Simpan file `.one-mind-key` dan password backup secara terpisah.
-6. Login di browser baru, buka tab **Kunci Lokal**, lalu import file backup.
+Browser:
 
-File export dienkripsi di browser memakai PBKDF2-SHA-256 600.000 iterasi dan AES-256-GCM.
+1. membuat AES-256-GCM key acak;
+2. mengenkripsi file;
+3. menghitung SHA-256 ciphertext;
+4. membungkus raw AES key untuk pemilik menggunakan DIPP public key;
+5. mengirim ciphertext dalam beberapa chunk sesuai ukuran file;
+6. menyelesaikan upload dengan envelope, hash, dan wrapped key pemilik.
 
-Backup server tetap perlu dilakukan terpisah dengan membackup volume `one_mind_data`.
+Server memverifikasi hash ciphertext gabungan lalu menyimpan envelope ciphertext dan metadata file.
 
-## Troubleshooting
+### 5. Download dan berbagi
 
-### Browser menolak HTTPS
+Server hanya mengembalikan file kepada akun yang memiliki record akses. Browser membuka wrapped key memakai DIPP private key di RAM, lalu mendekripsi ciphertext.
 
-Penyebab: sertifikat self-signed lokal.
+Owner dapat membagikan file sebagai `viewer` atau `editor`. Owner membuka AES key secara lokal dan membungkusnya kembali untuk DIPP public key penerima. Owner dapat mencabut akses; rotasi key diperlukan untuk melindungi versi file berikutnya dari key lama yang mungkin sudah diperoleh penerima.
 
-Solusi lokal: buka `https://localhost:8443`, pilih Advanced, lalu lanjutkan. Untuk produksi, gunakan sertifikat CA resmi dari Let's Encrypt atau reverse proxy seperti Caddy/Nginx/Traefik.
+### 6. Update dan rotasi key
 
-### Login gagal karena "Private key lokal tidak ada"
+Owner atau editor dapat mengganti isi file. Browser membuat AES key baru, mengenkripsi ulang file, dan membuat wrapped key baru untuk semua pengguna yang masih mempunyai akses.
 
-Private key terenkripsi disimpan di localStorage browser tempat akun dibuat. Jika pindah perangkat/browser, akun server masih ada tetapi private key lokal tidak ikut. Untuk versi berikutnya, tambahkan fitur export/import encrypted private key.
+## Data di Browser
 
-### File tidak bisa didekripsi
+Persisten di `localStorage`:
 
-Kemungkinan:
+- `om_token`
+- `om_username`
+- `om_admin_token`
+- `om_admin_username`
 
-- password lokal salah sehingga private key gagal dibuka,
-- file belum dibagikan ke akun tersebut,
-- wrapped key bukan untuk private key akun tersebut,
-- data storage rusak.
+Sementara di RAM tab:
 
-### Port 8443 sudah dipakai
+- DIPP private/public identity yang diimpor;
+- RSA Login private/public key yang diimpor atau dibuat;
+- AES file key selama operasi file;
+- plaintext file selama enkripsi/dekripsi;
+- password/form data selama request;
+- daftar file, envelope/ciphertext, daftar pengguna, dan metadata UI.
 
-Edit `docker-compose.yml`:
+Auto-lock private key 15 menit belum aktif dalam kode saat ini. Key di RAM dibersihkan saat logout, refresh, tab ditutup, proses browser berhenti, atau state login direset.
 
-```yaml
-ports:
-  - "9443:8443"
-```
+## Data di Server
 
-Lalu buka `https://localhost:9443`.
+Server menyimpan:
 
-## Siap ke Internet
+- SQLite database pengguna, administrator, certificate, audit admin, file, share, dan sesi upload;
+- hash password;
+- DIPP dan RSA public key;
+- ciphertext/envelope;
+- wrapped AES key setiap penerima;
+- `server_secret.bin` untuk menandatangani token;
+- private key TLS dan private key CA pada deployment/repository saat ini.
 
-Untuk deployment global:
+Server tidak dirancang menyimpan private key pengguna atau plaintext file. Namun operator server dapat mengubah JavaScript frontend yang dikirim ke browser; karena itu model ini belum melindungi pengguna dari server aktif yang berbahaya.
 
-1. Pakai domain tetap.
-2. Ganti self-signed certificate dengan Let's Encrypt atau TLS termination di reverse proxy.
-3. Set backup volume database dan storage.
-4. Tambahkan audit log dan monitoring; rate limit login dasar sudah aktif.
-5. Wajibkan prosedur export/import encrypted private key untuk pindah perangkat.
-6. Pertimbangkan OPAQUE/SRP untuk autentikasi zero-knowledge password.
+## Batasan Keamanan Penting
 
-## Catatan Intranet
+- File export DIPP dan RSA saat ini memuat private key tanpa enkripsi backup.
+- Token user/admin berada di `localStorage` dan dapat dibaca JavaScript pada origin aplikasi.
+- Private key di RAM belum memiliki timeout otomatis.
+- Password masih dikirim ke server melalui TLS; autentikasi belum memakai PAKE seperti OPAQUE/SRP.
+- DIPP-KEM adalah algoritma prototipe/custom dan belum boleh dianggap setara KEM standar yang diaudit.
+- Root CA key, intermediate CA key, TLS key, database, `server_secret.bin`, dan data runtime saat ini terlacak di Git. Jika repository pernah dibagikan, lakukan rotasi/revokasi seluruh secret terkait.
+- Rate limit login tersimpan in-memory dan reset saat proses/container restart.
+- TLS melindungi data saat transit, bukan dari server/operator yang menyajikan JavaScript berbahaya.
 
-Untuk penggunaan intranet, tetap gunakan HTTPS/TLS. Self-signed certificate masih mengenkripsi traffic, tetapi sertifikat dari internal CA lebih baik agar browser user dapat memverifikasi server.
+## Deployment Internet
 
-Rekomendasi tambahan:
+Gunakan `docker-compose.prod.yml` dan Caddy hanya setelah:
 
-- batasi port `8443` hanya untuk subnet intranet/VPN lewat firewall;
-- jangan expose port aplikasi ke internet;
-- set `ONE_MIND_ALLOWED_HOSTS` sesuai hostname/IP intranet;
-- atur `ONE_MIND_SESSION_SECONDS` sesuai kebijakan sesi;
-- pantau login gagal. Default rate limit adalah 8 kegagalan per 10 menit per IP+username.
+1. menetapkan domain dan email ACME;
+2. membatasi `ONE_MIND_ALLOWED_HOSTS` ke hostname produksi;
+3. memindahkan seluruh secret dan data aktif keluar dari Git;
+4. merotasi key yang pernah masuk repository;
+5. menyiapkan firewall, backup terenkripsi, logging, monitoring, dan rate limiting persisten;
+6. memperbaiki export private key agar terenkripsi;
+7. mengaktifkan auto-lock key dan mengurangi ketergantungan pada `localStorage` untuk token;
+8. melakukan audit kriptografi dan penetration test independen.
 
-## File Prototype Asli
+Implementasi saat ini adalah prototipe dan belum direkomendasikan untuk data produksi sensitif.
 
-Empat file prototype asli tetap disimpan di folder ini sebagai referensi:
+## Prototype Referensi
 
-- `Enkripsi_One_Mind_V_1.py`
-- `Key_Generator_and_Enkriptor_DIPP_One_Mind_v1.py`
-- `Server_One_Mind_Client.py`
-- `Server_One_Mind_Server.py`
+Kode referensi awal dipertahankan di `Referensi_Awal_Prototype/`. File tersebut bukan entry point aplikasi web saat ini dan tidak boleh digunakan sebagai sumber tunggal perilaku sistem.

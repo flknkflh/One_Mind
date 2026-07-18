@@ -1,388 +1,152 @@
-# PROJECT CONTEXT
+# ONE_MIND — Current Implementation Context
 
-You are working on an existing project called ONE_MIND.
+Dokumen ini adalah konteks teknis ringkas untuk pengembang/AI yang melanjutkan repository. Acuan utama tetap kode. Status dicocokkan pada 18 Juli 2026.
 
-DO NOT rewrite the project from scratch.
+## Project Scope
 
-DO NOT replace existing architecture.
+ONE_MIND adalah prototipe encrypted web drive berbasis FastAPI, JavaScript browser, SQLite, Docker, dan Caddy. File dienkripsi di browser menggunakan AES-256-GCM. AES file key dibungkus per penerima menggunakan implementasi DIPP-KEM custom/prototipe.
 
-FIRST understand the existing implementation before modifying anything.
+Do not describe this project as production-ready, military-grade, formally zero-knowledge, or cryptographically audited.
 
-This project already has a strong foundation and many security mechanisms have been implemented.
+## Current Architecture
 
-Your first responsibility is to preserve compatibility and stability.
+### Frontend
 
-Always read the related code before making changes.
+- Static files: `static/index.html`, `static/app.js`, `static/styles.css`.
+- No frontend framework or external CDN.
+- Web Crypto API for RSA, AES-GCM, SHA-256, and randomness.
+- DIPP implementation is embedded in `static/app.js`.
+- Ciphertext is uploaded in chunks after encryption in browser memory.
 
-Never remove existing functionality unless explicitly instructed.
+### Backend
 
-Always implement new features incrementally.
+- FastAPI entry point: `app/main.py`.
+- SQLite for users, administrators, certificates, audit events, files, shares, and upload sessions.
+- JSON envelope files under the configured data directory.
+- HMAC-signed custom bearer tokens.
+- Trusted-host checking, CSP, security headers, and no-store responses.
 
-========================================================
-PROJECT OVERVIEW
-========================================================
+### Deployment
 
-ONE_MIND is a secure document management and encrypted file sharing platform.
+- Local compose: Uvicorn HTTPS on port 8443 with local/self-signed certificate.
+- Production compose: Uvicorn HTTP port 8080 inside Docker, Caddy terminates HTTPS on 443.
 
-The goal is not merely encrypted storage.
+## Identity and Registration
 
-The goal is to build a complete secure document ecosystem with:
+Registration collects:
 
-- Identity Management
-- Public Key Infrastructure (PKI)
-- Digital Certificates
-- Secure File Encryption
-- Secure Sharing
-- Accountability
-- Audit Trail
-- Certificate Lifecycle
-- Zero Knowledge Server for Private Keys
+- username;
+- display name;
+- password;
+- NIP;
+- rank;
+- position;
+- DIPP public key;
+- RSA login public key.
 
-The project is intended for defense / military / government style environments where accountability and cryptographic identity are mandatory.
+The browser generates DIPP and RSA keypairs. The server stores both public keys and a PBKDF2-SHA-256 password hash. A new account is `PENDING` until administrator approval.
 
-========================================================
-CURRENT FOUNDATION (ALREADY IMPLEMENTED)
-========================================================
+The browser exports DIPP and RSA identity files. **Current exports contain unencrypted private-key material.** Do not claim that backup export uses PBKDF2 600,000 iterations or AES-GCM; that was an earlier design and is not the active implementation.
 
-The following components already exist and MUST be preserved.
+## Authentication
 
-### Authentication
+User authentication is two-stage:
 
-- Username / Password
-- JWT authentication
+1. `/api/login` verifies password and account status, returning a short-lived pending-login token.
+2. `/api/login/challenge` returns a nonce.
+3. Browser signs the nonce using the imported RSA Login private key.
+4. `/api/login/verify` checks public-key equality, signature, account status, and certificate state.
+5. The backend issues the main bearer token.
 
-### DIPP Identity
+The first successful RSA verification automatically issues an internal user certificate if none exists. Later logins require the latest certificate to remain active and unexpired.
 
-The browser generates a DIPP keypair.
+Admin authentication uses separate password login and admin bearer tokens.
 
-The DIPP private key NEVER leaves the client.
+Passwords are sent to the server over TLS. Authentication is not PAKE/OPAQUE/SRP.
 
-The server stores ONLY the DIPP public key.
+## Browser Storage and RAM
 
-Identity can be exported/imported.
+`localStorage` keys:
 
-### File Encryption
+- `om_token`
+- `om_username`
+- `om_admin_token`
+- `om_admin_username`
 
-Hybrid Encryption
+DIPP and RSA private keys are not persisted in `localStorage` by current code. Imported/generated keys live in tab memory. DIPP identity, RSA CryptoKey, AES keys, raw AES key bytes during wrapping, plaintext, ciphertext, form passwords, pending tokens, and loaded API data may all exist temporarily in RAM.
 
-AES-GCM
+The previously planned 15-minute private-key auto-lock is commented out and not active. Do not document it as implemented.
 
-Wrapped file keys
+## File Workflow
 
-Chunked upload
+### Upload
 
-Resume upload
+1. Generate AES-256-GCM key and IV.
+2. Encrypt file in browser.
+3. Calculate SHA-256 of ciphertext.
+4. Wrap AES key for owner using DIPP public key.
+5. Start upload session.
+6. Send base64 ciphertext chunks.
+7. Finish upload with envelope, hash, and owner wrapped key.
+8. Backend merges chunks, validates hash, and stores envelope/share metadata.
 
-Upload session management
+### Download
 
-Automatic cleanup
+1. Authenticated user requests a file for which a share record exists.
+2. Server returns envelope and that user's wrapped key.
+3. Browser unwraps AES key using DIPP private identity in RAM.
+4. Browser decrypts and downloads plaintext.
 
-### PKI Foundation
+### Share
 
-RSA keypair generation inside browser
+Owner unwraps the current AES key locally and wraps it for the recipient's DIPP public key. Permission is `viewer` or `editor`.
 
-PKI private key NEVER leaves browser
+### Update/Rotate
 
-PKI public key stored on server
+Owner or editor encrypts replacement content with a new AES key and submits a wrapped key for every currently authorized user. Backend requires the submitted recipient set to match current access.
 
-Challenge endpoint
+### Revoke
 
-Proof of Possession implemented
+Only owner may revoke. Revocation removes future server access but cannot erase plaintext/key/ciphertext already copied. Rotate for subsequent versions.
 
-RSA Signature verification already implemented
+## Authorization Roles
 
-Certificate Request database already exists
+- `owner`: read, rename, update/rotate, manage access, delete.
+- `editor`: read, rename, update/rotate.
+- `viewer`: read/decrypt.
 
-Certificate table already exists
+## Administrator Capabilities
 
-Certificate Revocation table already exists
+- Initialize first administrator.
+- Login and change admin password.
+- List users grouped by account/certificate status.
+- Edit display name, NIP, rank, and position.
+- Approve, reject, revoke, restore, and soft-delete accounts.
+- Record administrative audit events.
 
-========================================================
-CURRENT ARCHITECTURE
-========================================================
+## Security Facts That Must Remain Explicit
 
-Client
+- DIPP-KEM is custom/prototype and not a substitute for an audited standard KEM.
+- User/admin tokens in `localStorage` are accessible to same-origin JavaScript.
+- A compromised/operator-controlled server can serve modified frontend JavaScript and steal browser secrets.
+- Exported DIPP/RSA private keys are not encrypted by the current app.
+- Private key auto-lock is inactive.
+- Login rate limiting is in-process memory and resets on restart.
+- Repository currently tracks CA/TLS private keys, server signing secret, databases, and runtime data; these must be removed from source control and rotated before real deployment.
+- TLS protects data in transit but not against a malicious server endpoint.
 
-↓
+## Compatibility Guidance
 
-Generate DIPP
+- Do not silently change or remove existing endpoints.
+- Database migrations must preserve existing user/file/share/certificate data.
+- Changes to DIPP/envelope/wrapped-key formats require explicit versioning and migration.
+- Changes to key export must support a safe transition from existing plaintext export files.
+- Documentation must describe implemented behavior and separately label planned behavior.
 
-↓
+## Primary Documentation
 
-Generate PKI RSA
-
-↓
-
-Register
-
-↓
-
-Server stores
-
-- DIPP Public Key
-
-- PKI Public Key
-
-↓
-
-Private Keys remain inside browser
-
-========================================================
-CURRENT DEVELOPMENT DIRECTION
-========================================================
-
-We are now expanding the identity lifecycle.
-
-The architecture MUST evolve carefully without breaking previous functionality.
-
-========================================================
-TARGET ARCHITECTURE
-========================================================
-
-Identity lifecycle:
-
-Register
-
-↓
-
-Generate Identity
-
-↓
-
-Administrator Approval
-
-↓
-
-Certificate Request
-
-↓
-
-Proof of Possession
-
-↓
-
-Certificate Issue
-
-↓
-
-Certificate Usage
-
-↓
-
-Certificate Renewal
-
-↓
-
-Certificate Revocation
-
-↓
-
-Certificate Replacement
-
-========================================================
-NEW IDENTITY MODEL
-========================================================
-
-User registration now includes:
-
-- Username
-
-- Display Name
-
-- Password
-
-- NIP
-
-- Rank
-
-- Position
-
-The users table should evolve to include:
-
-username
-
-display_name
-
-password_hash
-
-nip
-
-rank
-
-position
-
-public_key
-
-pki_public_key
-
-account_status
-
-certificate_status
-
-created_at
-
-approved_at
-
-approved_by
-
-revoked_at
-
-revoked_by
-
-deleted_at
-
-deleted_by
-
-========================================================
-ACCOUNT STATUS
-========================================================
-
-PENDING
-
-ACTIVE
-
-REJECTED
-
-DELETED
-
-========================================================
-CERTIFICATE STATUS
-========================================================
-
-NONE
-
-ISSUED
-
-REVOKED
-
-EXPIRED
-
-REPLACED
-
-Account Status and Certificate Status MUST remain independent.
-
-========================================================
-ADMINISTRATOR
-========================================================
-
-An administrator portal will be added.
-
-Administrator authentication is completely separate from user authentication.
-
-Initially administrator only uses:
-
-Username
-
-Password
-
-Future capabilities:
-
-Approve User
-
-Reject User
-
-Edit User Metadata
-
-Revoke User
-
-Restore User
-
-Delete User (soft delete)
-
-Issue Certificate
-
-Revoke Certificate
-
-View Audit Logs
-
-========================================================
-IDENTITY FILE
-========================================================
-
-The project is moving away from DIPP-only identity.
-
-Eventually a unified ONE_MIND Identity file will exist.
-
-It will contain:
-
-DIPP Keys
-
-PKI Keys
-
-Certificate
-
-Metadata
-
-Version
-
-The server NEVER stores private keys.
-
-========================================================
-IMPORTANT DESIGN RULES
-========================================================
-
-Never store any private key on the server.
-
-Never transmit private keys over the network.
-
-Only public keys are stored server-side.
-
-Proof of Possession must always verify ownership of the private key.
-
-Backward compatibility is important.
-
-Prefer database migrations over destructive schema changes.
-
-Do not remove existing endpoints unless instructed.
-
-========================================================
-WORKFLOW
-========================================================
-
-Before implementing anything:
-
-1. Read existing implementation.
-
-2. Explain the impact.
-
-3. Implement minimal safe changes.
-
-4. Verify existing features still work.
-
-5. Suggest testing procedure.
-
-========================================================
-GIT RULES
-========================================================
-
-Every completed feature MUST end with:
-
-git status
-
-git add .
-
-git commit -m "<clear commit message>"
-
-Keep commits focused.
-
-========================================================
-FINAL GOAL
-========================================================
-
-Build ONE_MIND into a secure enterprise-grade document management system with:
-
-- Identity Management
-
-- PKI
-
-- Certificate Lifecycle
-
-- Secure File Encryption
-
-- Secure Sharing
-
-- Accountability
-
-- Cryptographic Audit Trail
-
-without breaking the already existing secure foundation.
+- `README.md`: overview and quick start.
+- `docs/MANUAL_BOOK.md`: operation, workflows, and endpoint inventory.
+- `docs/SECURITY.md`: threat model, limitations, and hardening.
+- `docs/TLS_MIGRATION.md`: local/intranet/production TLS deployment.
+- `Referensi_Awal_Prototype.md`: status of historical prototype sources.
