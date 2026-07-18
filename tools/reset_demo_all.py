@@ -47,20 +47,26 @@ def reset_database():
 
     conn = sqlite3.connect(DB)
 
+    conn.execute("PRAGMA foreign_keys = OFF")
+
     cur = conn.cursor()
 
     print("\nMembersihkan database...\n")
 
     tables = [
 
+        # File System
         "shares",
         "files",
         "upload_sessions",
 
+        # PKI
+        "certificate_challenges",
         "certificate_requests",
-        "certificate_revocation",
         "certificates",
+        "certificate_revocation",
 
+        # User
         "users"
 
     ]
@@ -78,6 +84,8 @@ def reset_database():
             print(f"✗ {table} : {e}")
 
     conn.commit()
+
+    conn.execute("PRAGMA foreign_keys = ON")
 
     conn.close()
 
@@ -126,6 +134,7 @@ def main():
     print("\nYang DIHAPUS:")
 
     print("  ✓ Users")
+    print("  ✓ Certificate Challenges")
     print("  ✓ Certificate Requests")
     print("  ✓ Certificates")
     print("  ✓ Certificate Revocation")

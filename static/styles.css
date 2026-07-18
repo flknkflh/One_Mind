@@ -477,3 +477,13 @@ code {
   .panelHead { flex-direction: column; }
   button, .importKeyControl { width: 100%; justify-content: center; }
 }
+
+
+.loginHint {
+  margin: -2px 0 14px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-dark);
+  font-size: 13px;
+}

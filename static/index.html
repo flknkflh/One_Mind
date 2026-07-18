@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ONE_MIND</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260707-session1">
+  <link rel="stylesheet" href="/static/styles.css?v=20260716-rsa-login-final1">
 </head>
 <body>
   <main class="shell">
@@ -31,14 +31,27 @@
         <div class="warningBox">
 
           <strong>
-            ONE_MIND Identity akan dibuat dan diunduh ke komputer Anda.
+            Identitas Digital ONE_MIND akan dibuat dan diunduh ke komputer Anda.
           </strong>
 
           <p>
-            Server <b>tidak pernah menyimpan Private Key DIPP maupun PKI</b>.
-            Setelah registrasi selesai browser akan mengunduh
-            <b>ONE_MIND Identity (.omid)</b>.
-            Simpan file tersebut karena diperlukan untuk login dan membuka data.
+            Server <b>tidak pernah menyimpan Private Key DIPP maupun RSA Login Key</b>.
+            Setelah registrasi, browser akan mengunduh dua file:
+
+            <br><br>
+
+            • <b>ONE_MIND_DIPP (.dipp)</b><br>
+            Digunakan untuk membuka, mengenkripsi, mendekripsi, dan membagikan file di dalam aplikasi.
+
+            <br><br>
+
+            • <b>ONE_MIND_RSA (.key)</b><br>
+            Wajib digunakan pada setiap login untuk menandatangani challenge RSA.
+            Pada login pertama, challenge yang berhasil sekaligus mengaktifkan certificate akun di server.
+
+            <br><br>
+
+            Simpan kedua file tersebut dengan aman. Kehilangan salah satunya dapat membuat akun atau data tidak dapat digunakan.
           </p>
 
         </div>
@@ -139,6 +152,10 @@
             required>
 
         </label>
+
+        <p class="loginHint">
+          Setelah username, password, dan DIPP valid, browser akan meminta file ONE_MIND_RSA (.key) untuk challenge login.
+        </p>
 
         <button type="submit">
 
@@ -452,29 +469,28 @@
 
             <div class="panel">
 
-              <h2>Identitas DIPP</h2>
+              <h2>ONE_MIND Identity</h2>
 
               <p id="localKeyStatus" class="keyStatus"></p>
 
               <div class="warningBox">
 
                 <strong>
-                  Private Key DIPP tidak pernah disimpan di server.
+                  Private Key DIPP dan RSA Login Key tidak pernah disimpan di server maupun browser.
                 </strong>
 
                 <p>
-                  Private Key DIPP tidak pernah disimpan di browser.
-                  Private Key hanya berada pada:
+                  Kedua private key hanya berada pada file identitas milik pengguna dan RAM browser selama sesi aktif.
                 </p>
 
                 <ul>
-                  <li>File .dipp</li>
-                  <li>RAM browser selama login</li>
+                  <li>ONE_MIND_DIPP (.dipp) untuk operasi kriptografi file.</li>
+                  <li>ONE_MIND_RSA (.key) untuk challenge pada setiap login.</li>
+                  <li>Certificate disimpan server sebagai status aktivasi akun setelah login pertama berhasil.</li>
                 </ul>
 
                 <p>
-                  Kehilangan file .dipp dapat menyebabkan file terenkripsi
-                  milik pengguna tidak dapat dibuka kembali.
+                  Jangan membagikan file DIPP atau RSA Login Key kepada siapa pun.
                 </p>
 
               </div>
@@ -484,24 +500,54 @@
                 <h3>Praktik yang Direkomendasikan</h3>
 
                 <ol>
-                  <li>Simpan file DIPP.</li>
-                  <li>Backup ke media offline.</li>
-                  <li>Jangan membagikan file DIPP.</li>
-                  <li>Jika berpindah komputer cukup login lalu import file DIPP kembali.</li>
+
+                <li>Simpan file ONE_MIND_DIPP dan ONE_MIND_RSA.</li>
+
+                <li>Backup kedua file ke media offline yang aman.</li>
+
+                <li>Jangan pernah membagikan kedua file tersebut.</li>
+
+                <li>Jika berpindah komputer, gunakan file DIPP dan RSA Login Key yang sama saat login.</li>
+
                 </ol>
 
               </div>
 
               <div class="keyActions">
 
-                <button id="exportDippBtn" type="button">
-                  Export Identitas DIPP
-                </button>
+                  <button id="exportDippBtn" type="button">
 
-                <label class="importKeyControl">
-                  Import Identitas DIPP
-                  <input id="importDippInput" type="file" accept=".dipp">
-                </label>
+                      Export DIPP Identity
+
+                  </button>
+
+                  <button id="exportRsaBtn" type="button">
+
+                      Export RSA Login Key
+
+                  </button>
+
+                  <label class="importKeyControl">
+
+                      Import DIPP Identity
+
+                      <input
+                          id="importDippInput"
+                          type="file"
+                          accept=".dipp">
+
+                  </label>
+
+                  <label class="importKeyControl">
+
+                      Import RSA Login Key
+
+                      <input
+                          id="importRsaInput"
+                          type="file"
+                          accept=".key">
+
+                  </label>
 
               </div>
 
@@ -515,6 +561,6 @@
     <section id="notice" class="notice hidden"></section>
     <input id="updateFileInput" class="hidden" type="file">
   </main>
-  <script src="/static/app.js?v=20260714-account-status1"></script>
+  <script src="/static/app.js?v=20260716-rsa-login-final1"></script>
 </body>
 </html>

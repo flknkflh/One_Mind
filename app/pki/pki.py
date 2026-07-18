@@ -583,16 +583,26 @@ def issue_certificate(
 
     username: str,
 
+    public_key_pem: str,
+
 ):
 
-    csr = load_csr(username)
+    public_key = serialization.load_pem_public_key(
+
+        public_key_pem.encode("utf-8")
+
+    )
 
     intermediate_key = load_private_key(
+
         INTERMEDIATE_KEY
+
     )
 
     intermediate_cert = load_certificate(
+
         INTERMEDIATE_CERT
+
     )
 
     certificate = (
@@ -600,27 +610,71 @@ def issue_certificate(
         x509.CertificateBuilder()
 
         .subject_name(
-            csr.subject
+
+            x509.Name(
+
+                [
+
+                    x509.NameAttribute(
+
+                        NameOID.COUNTRY_NAME,
+
+                        "ID"
+
+                    ),
+
+                    x509.NameAttribute(
+
+                        NameOID.ORGANIZATION_NAME,
+
+                        "ONE_MIND"
+
+                    ),
+
+                    x509.NameAttribute(
+
+                        NameOID.COMMON_NAME,
+
+                        username
+
+                    ),
+
+                ]
+
+            )
+
         )
 
         .issuer_name(
+
             intermediate_cert.subject
+
         )
 
         .public_key(
-            csr.public_key()
+
+            public_key
+
         )
 
         .serial_number(
+
             x509.random_serial_number()
+
         )
 
         .not_valid_before(
+
             datetime.utcnow()
+
         )
 
         .not_valid_after(
-            datetime.utcnow() + timedelta(days=365)
+
+            datetime.utcnow()
+
+            + timedelta(days=365)
+
         )
 
         .add_extension(
@@ -678,8 +732,11 @@ def issue_certificate(
     path = ISSUED_DIR / f"{username}.crt"
 
     save_certificate(
+
         path,
+
         certificate
+
     )
 
     return path

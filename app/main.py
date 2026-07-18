@@ -4,29 +4,23 @@ import hmac
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import time
-import shutil
-import secrets
-import base64
-
-from cryptography import x509
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
-from pathlib import Path
 
-
-
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from app.pki.pki import issue_certificate   
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.exceptions import InvalidSignature
+
+from app.pki.pki import issue_certificate
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -39,6 +33,7 @@ SECRET_PATH = DATA_DIR / "keys" / "server_secret.bin"
 PBKDF2_ITERATIONS = 390_000
 SESSION_SECONDS = int(os.environ.get("ONE_MIND_SESSION_SECONDS", "43200"))
 ADMIN_SESSION_SECONDS = int(os.environ.get("ONE_MIND_ADMIN_SESSION_SECONDS", "43200"))
+PENDING_LOGIN_SECONDS = int(os.environ.get("ONE_MIND_PENDING_LOGIN_SECONDS", "300"))
 LOGIN_WINDOW_SECONDS = int(os.environ.get("ONE_MIND_LOGIN_WINDOW_SECONDS", "600"))
 LOGIN_MAX_FAILURES = int(os.environ.get("ONE_MIND_LOGIN_MAX_FAILURES", "8"))
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get("ONE_MIND_ALLOWED_HOSTS", "*").split(",") if h.strip()]
@@ -179,6 +174,43 @@ def sign_token(username: str) -> str:
     return f"{raw}.{sig}"
 
 
+def sign_pending_login_token(username: str) -> str:
+    nonce = new_id(24)
+    payload = {
+        "type": "login_pending",
+        "username": username,
+        "nonce": nonce,
+        "exp": int(time.time()) + PENDING_LOGIN_SECONDS,
+    }
+    raw = b64e(json.dumps(payload, sort_keys=True).encode("utf-8"))
+    sig = hmac.new(get_secret(), raw.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{raw}.{sig}"
+
+
+def verify_pending_login_token(token: str) -> str:
+    try:
+        raw, sig = token.split(".", 1)
+        expected = hmac.new(get_secret(), raw.encode("ascii"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            raise ValueError
+        payload = json.loads(b64d(raw).decode("utf-8"))
+        if payload.get("type") != "login_pending":
+            raise ValueError
+        if int(payload.get("exp", 0)) < int(time.time()):
+            raise HTTPException(
+                status_code=401,
+                detail="Proses login sudah kedaluwarsa. Silakan login ulang.",
+            )
+        return payload["username"]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=401,
+            detail="Token proses login tidak valid.",
+        ) from exc
+
+
 def verify_token(token: str) -> str:
     try:
         raw, sig = token.split(".", 1)
@@ -269,12 +301,14 @@ def verify_pki_signature(
             signature,
             nonce.encode("utf-8"),
             padding.PKCS1v15(),
-            hashes.SHA256(),
+            hashes.SHA512(),
         )
 
         return True
 
-    except Exception:
+    except Exception as e:
+
+        print("VERIFY ERROR:", repr(e))
 
         return False
 
@@ -554,6 +588,30 @@ def db() -> sqlite3.Connection:
 
     return conn
 
+def current_pending_login_user(
+    authorization: str | None = Header(default=None),
+) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token proses login diperlukan.")
+
+    username = verify_pending_login_token(
+        authorization.removeprefix("Bearer ").strip()
+    )
+
+    conn = db()
+    row = conn.execute(
+        "SELECT account_status FROM users WHERE username=?",
+        (username,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=401, detail="Akun tidak ditemukan.")
+
+    enforce_active_account(row["account_status"])
+    return username
+
+
 def current_user(authorization: str | None = Header(default=None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Login diperlukan.")
@@ -574,6 +632,7 @@ def current_user(authorization: str | None = Header(default=None)) -> str:
 
     if not row:
         raise HTTPException(status_code=401, detail="Akun tidak ditemukan.")
+        
 
     enforce_active_account(row["account_status"])
 
@@ -698,6 +757,12 @@ class LoginIn(BaseModel):
     password: str
 
 
+class LoginVerifyIn(BaseModel):
+    nonce: str
+    signature: str
+    public_key_pem: str
+
+
 class AdminSetupIn(BaseModel):
     username: str = Field(min_length=3, max_length=80)
     password: str = Field(min_length=8)
@@ -770,12 +835,6 @@ class FileUpdateIn(BaseModel):
 class FileRenameIn(BaseModel):
     filename: str = Field(min_length=1, max_length=240)
 
-class CertificateRequestIn(BaseModel):
-    nonce: str
-    signature: str
-
-class CertificateIssueIn(BaseModel):
-    request_id: int
 
 app = FastAPI(title="ONE_MIND", version="2.0")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
@@ -1034,6 +1093,7 @@ def admin_users(admin_username: str = Depends(current_admin)):
     }
 
 
+
 @app.patch("/api/admin/users/{target_username}")
 def admin_edit_user(
     target_username: str,
@@ -1102,21 +1162,35 @@ def admin_approve_user(
     conn = db()
 
     try:
+
         user = conn.execute(
-            "SELECT account_status FROM users WHERE username=?",
-            (target_username,),
+            """
+            SELECT account_status
+            FROM users
+            WHERE username=?
+            """,
+            (
+                target_username,
+            ),
         ).fetchone()
 
         if not user:
-            raise HTTPException(status_code=404, detail="User tidak ditemukan.")
+            raise HTTPException(
+                status_code=404,
+                detail="User tidak ditemukan."
+            )
 
         if user["account_status"] == "DELETED":
-            raise HTTPException(status_code=400, detail="User deleted harus direstore terlebih dahulu.")
+            raise HTTPException(
+                status_code=400,
+                detail="User deleted harus direstore terlebih dahulu."
+            )
 
         conn.execute(
             """
             UPDATE users
-            SET account_status='ACTIVE',
+            SET
+                account_status='ACTIVE',
                 approved_at=?,
                 approved_by=?,
                 revoked_at=NULL,
@@ -1132,17 +1206,29 @@ def admin_approve_user(
             ),
         )
 
-        record_admin_audit(conn, admin_username, "USER_APPROVED", target_username)
+
+        record_admin_audit(
+            conn,
+            admin_username,
+            "USER_APPROVED",
+            target_username,
+        )
+
         conn.commit()
 
     except Exception:
+
         conn.rollback()
+
         raise
 
     finally:
+
         conn.close()
 
-    return {"ok": True}
+    return {
+        "ok": True
+    }
 
 
 @app.post("/api/admin/users/{target_username}/reject")
@@ -1421,143 +1507,326 @@ def register(data: RegisterIn):
 
 
 @app.post("/api/login")
-def login(data: LoginIn, request: Request):
-    rate_key = check_login_rate(request, data.username)
+def login(
+    data: LoginIn,
+    request: Request,
+):
+    """Tahap awal login: password diperiksa, tetapi JWT utama belum diterbitkan."""
+
+    username = data.username.strip()
+    rate_key = check_login_rate(request, username)
     conn = db()
+
     row = conn.execute(
         """
-        SELECT
-            password_hash,
-            account_status
+        SELECT password_hash, account_status
         FROM users
         WHERE username=?
         """,
-        (
-            data.username,
-        ),
+        (username,),
     ).fetchone()
-    conn.close()
+
     if not row or not verify_password(data.password, row["password_hash"]):
+        conn.close()
         record_login_failure(rate_key)
-        raise HTTPException(status_code=401, detail="Username atau password salah.")
+        raise HTTPException(
+            status_code=401,
+            detail="Username atau password salah.",
+        )
 
     clear_login_failures(rate_key)
-
     enforce_active_account(row["account_status"])
 
-    return {
-        "token": sign_token(data.username),
-        "username": data.username,
-        "account_status": row["account_status"],
-    }
-
-@app.get("/api/certificate/requests")
-def certificate_requests(username: str = Depends(current_user)):
-
-    conn = db()
-
-    rows = conn.execute(
+    cert = conn.execute(
         """
-        SELECT
-            id,
-            username,
-            status,
-            created_at
-        FROM certificate_requests
-        ORDER BY created_at DESC
-        """
-    ).fetchall()
+        SELECT serial_number, status, expires_at
+        FROM certificates
+        WHERE username=?
+        ORDER BY issued_at DESC
+        LIMIT 1
+        """,
+        (username,),
+    ).fetchone()
+
+    certificate_status = "NONE"
+
+    if cert:
+        certificate_status = cert["status"]
+
+        if (
+            cert["status"] == "ACTIVE"
+            and datetime.fromisoformat(cert["expires_at"])
+            <= datetime.now(timezone.utc)
+        ):
+            certificate_status = "EXPIRED"
+            conn.execute(
+                "UPDATE certificates SET status='EXPIRED' WHERE serial_number=?",
+                (cert["serial_number"],),
+            )
+            conn.execute(
+                "UPDATE users SET certificate_status='EXPIRED' WHERE username=?",
+                (username,),
+            )
+            conn.commit()
+        elif cert["status"] == "ACTIVE":
+            certificate_status = "ISSUED"
 
     conn.close()
 
-    return [
-        {
-            "id": row["id"],
-            "username": row["username"],
-            "status": row["status"],
-            "created_at": row["created_at"],
-        }
-        for row in rows
-    ]
+    return {
+        "login_token": sign_pending_login_token(username),
+        "username": username,
+        "account_status": row["account_status"],
+        "certificate_status": certificate_status,
+        "next": "RSA_CHALLENGE",
+    }
 
-@app.post("/api/certificate/issue")
-def certificate_issue(
-    data: CertificateIssueIn,
-    username: str = Depends(current_user),
+
+@app.post("/api/login/challenge")
+def login_challenge(
+    username: str = Depends(current_pending_login_user),
 ):
+    nonce = secrets.token_hex(32)
     conn = db()
 
-    req = conn.execute(
+    conn.execute(
         """
-        SELECT *
-        FROM certificate_requests
-        WHERE id=?
+        INSERT OR REPLACE INTO certificate_challenges
+        (username, nonce, created_at)
+        VALUES (?, ?, ?)
         """,
-        (data.request_id,),
-    ).fetchone()
+        (username, nonce, now_iso()),
+    )
 
-    if not req:
-        conn.close()
-        raise HTTPException(
-            status_code=404,
-            detail="CSR tidak ditemukan."
-        )
+    conn.commit()
+    conn.close()
+    return {"nonce": nonce}
 
-    if req["status"] != "PENDING":
-        conn.close()
-        raise HTTPException(
-            status_code=400,
-            detail="CSR sudah diproses."
+
+@app.post("/api/login/verify")
+def login_verify(
+    data: LoginVerifyIn,
+    username: str = Depends(current_pending_login_user),
+):
+    """RSA proof setiap login; login pertama sekaligus mengaktifkan certificate."""
+
+    conn = db()
+
+    try:
+        challenge = conn.execute(
+            "SELECT nonce FROM certificate_challenges WHERE username=?",
+            (username,),
+        ).fetchone()
+
+        if not challenge:
+            raise HTTPException(
+                status_code=400,
+                detail="Challenge login tidak ditemukan.",
+            )
+
+        if challenge["nonce"] != data.nonce:
+            raise HTTPException(
+                status_code=400,
+                detail="Challenge login tidak valid.",
+            )
+
+        user = conn.execute(
+            """
+            SELECT account_status, pki_public_key
+            FROM users
+            WHERE username=?
+            """,
+            (username,),
+        ).fetchone()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User tidak ditemukan.")
+
+        enforce_active_account(user["account_status"])
+
+        if not user["pki_public_key"]:
+            raise HTTPException(
+                status_code=400,
+                detail="RSA Public Key user belum tersedia.",
+            )
+
+        if user["pki_public_key"].strip() != data.public_key_pem.strip():
+            raise HTTPException(
+                status_code=401,
+                detail="RSA Login Key bukan milik user ini.",
+            )
+
+        if not verify_pki_signature(
+            user["pki_public_key"],
+            data.nonce,
+            data.signature,
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="Proof of Possession RSA tidak valid.",
+            )
+
+        latest_cert = conn.execute(
+            """
+            SELECT serial_number, status, expires_at
+            FROM certificates
+            WHERE username=?
+            ORDER BY issued_at DESC
+            LIMIT 1
+            """,
+            (username,),
+        ).fetchone()
+
+        certificate_issued = False
+        certificate_serial = None
+
+        if not latest_cert:
+            issued = issue_certificate_core(conn, username)
+            certificate_issued = True
+            certificate_serial = issued["serial_number"]
+
+        else:
+            certificate_serial = latest_cert["serial_number"]
+
+            if latest_cert["status"] != "ACTIVE":
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "Certificate akun tidak aktif: "
+                        + latest_cert["status"]
+                    ),
+                )
+
+            if (
+                datetime.fromisoformat(latest_cert["expires_at"])
+                <= datetime.now(timezone.utc)
+            ):
+                conn.execute(
+                    "UPDATE certificates SET status='EXPIRED' WHERE serial_number=?",
+                    (latest_cert["serial_number"],),
+                )
+                conn.execute(
+                    "UPDATE users SET certificate_status='EXPIRED' WHERE username=?",
+                    (username,),
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail="Certificate akun sudah expired.",
+                )
+
+            conn.execute(
+                "UPDATE users SET certificate_status='ISSUED' WHERE username=?",
+                (username,),
+            )
+
+        conn.execute(
+            "DELETE FROM certificate_challenges WHERE username=?",
+            (username,),
         )
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    return {
+        "token": sign_token(username),
+        "username": username,
+        "account_status": "ACTIVE",
+        "certificate_status": "ISSUED",
+        "certificate_issued": certificate_issued,
+        "certificate_serial": certificate_serial,
+    }
+
+
+def issue_certificate_core(
+    conn: sqlite3.Connection,
+    target_username: str,
+):
+    """
+    Engine penerbitan certificate.
+    Dipakai oleh:
+    - Administrator
+    - Auto Enrollment
+    """
 
     # ===================================================
-    # Issue Certificate
+    # Pastikan belum punya certificate aktif
     # ===================================================
+
     existing = conn.execute(
         """
-        SELECT id
+        SELECT serial_number
         FROM certificates
         WHERE username=?
         AND status='ACTIVE'
         """,
         (
-            req["username"],
+            target_username,
         ),
     ).fetchone()
 
     if existing:
-        conn.close()
         raise HTTPException(
             status_code=400,
             detail="User sudah memiliki certificate aktif."
         )
+
     # ===================================================
-    # Simpan CSR ke file sementara
-    # karena engine PKI bekerja berbasis file
+    # Ambil Public Key User
     # ===================================================
 
-    csr_path = Path(__file__).parent / "pki" / "csr" / f"{req['username']}.csr"
-    
-    csr_path.write_text(
-        req["csr_pem"],
-        encoding="utf-8"
-    )
+    user = conn.execute(
+        """
+        SELECT
+            pki_public_key
+        FROM users
+        WHERE username=?
+        """,
+        (
+            target_username,
+        ),
+    ).fetchone()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User tidak ditemukan."
+        )
+
+    if not user["pki_public_key"]:
+        raise HTTPException(
+            status_code=400,
+            detail="PKI Public Key belum tersedia."
+        )
 
     # ===================================================
     # Issue Certificate
     # ===================================================
 
     cert_path = issue_certificate(
-        req["username"]
+
+        target_username,
+
+        user["pki_public_key"]
+
     )
 
-    certificate_pem = Path(cert_path).read_text(
+    certificate_pem = Path(
+        cert_path
+    ).read_text(
         encoding="utf-8"
     )
 
     cert = x509.load_pem_x509_certificate(
-    certificate_pem.encode("utf-8")
+        certificate_pem.encode("utf-8")
     )
+
+    serial_number = format(cert.serial_number, "X")
+    expires_at = cert.not_valid_after_utc.isoformat()
 
     conn.execute(
         """
@@ -1574,32 +1843,78 @@ def certificate_issue(
         (?, ?, ?, ?, ?, ?)
         """,
         (
-            format(cert.serial_number, "X"),
-            req["username"],
+            serial_number,
+            target_username,
             certificate_pem,
             cert.not_valid_before_utc.isoformat(),
-            cert.not_valid_after_utc.isoformat(),
+            expires_at,
             "ACTIVE",
         ),
     )
+
     conn.execute(
-        """
-        UPDATE certificate_requests
-        SET status='ISSUED'
-        WHERE id=?
-        """,
-        (
-            data.request_id,
-        ),
+        "UPDATE users SET certificate_status='ISSUED' WHERE username=?",
+        (target_username,),
     )
 
-    conn.commit()
+    return {
+        "certificate_pem": certificate_pem,
+        "public_key_pem": user["pki_public_key"],
+        "serial_number": serial_number,
+        "expires_at": expires_at,
+    }
+
+
+@app.get("/api/certificate/me")
+def certificate_me(
+    username: str = Depends(current_user),
+):
+
+    conn = db()
+
+    row = conn.execute(
+        """
+        SELECT
+            serial_number,
+            certificate_pem,
+            issued_at,
+            expires_at,
+            status
+        FROM certificates
+        WHERE username=?
+        ORDER BY issued_at DESC
+        LIMIT 1
+        """,
+        (
+            username,
+        ),
+    ).fetchone()
 
     conn.close()
 
+    if not row:
+
+        return {
+            "status": "NONE"
+        }
+
     return {
-        "ok": True,
-        "message": "Certificate berhasil diterbitkan."
+
+        "status":
+            row["status"],
+
+        "serial_number":
+            row["serial_number"],
+
+        "issued_at":
+            row["issued_at"],
+
+        "expires_at":
+            row["expires_at"],
+
+        "certificate_pem":
+            row["certificate_pem"]
+
     }
 
 @app.get("/api/me")
@@ -1639,184 +1954,6 @@ def user_public_key(target_username: str, username: str = Depends(current_user))
         raise HTTPException(status_code=404, detail="User tidak ditemukan.")
     return {"username": row["username"], "display_name": row["display_name"], "public_key": json.loads(row["public_key"])}
 
-@app.get(
-    "/api/certificate/challenge",
-    response_model=CertificateChallengeOut
-)
-def certificate_challenge(
-    username: str = Depends(current_user),
-):
-
-    conn = db()
-
-    nonce = secrets.token_hex(32)
-
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO certificate_challenges
-        (
-            username,
-            nonce,
-            created_at
-        )
-        VALUES
-        (?, ?, ?)
-        """,
-        (
-            username,
-            nonce,
-            now_iso(),
-        ),
-    )
-
-    conn.commit()
-
-    conn.close()
-
-    return {
-        "nonce": nonce
-    }
-
-@app.post("/api/certificate/request")
-def certificate_request(
-    data: CertificateRequestIn,
-    username: str = Depends(current_user),
-):
-
-    conn = db()
-
-    # =====================================
-    # Ambil challenge milik user
-    # =====================================
-
-    row = conn.execute(
-        """
-        SELECT nonce
-        FROM certificate_challenges
-        WHERE username=?
-        """,
-        (
-            username,
-        ),
-    ).fetchone()
-
-    if not row:
-
-        conn.close()
-
-        raise HTTPException(
-            status_code=400,
-            detail="Challenge tidak ditemukan."
-        )
-
-    # =====================================
-    # Pastikan nonce cocok
-    # =====================================
-
-    if row["nonce"] != data.nonce:
-
-        conn.close()
-
-        raise HTTPException(
-            status_code=400,
-            detail="Challenge tidak valid."
-        )
-
-    # =====================================
-    # Ambil PKI Public Key User
-    # =====================================
-
-    user = conn.execute(
-        """
-        SELECT pki_public_key
-        FROM users
-        WHERE username=?
-        """,
-        (
-            username,
-        ),
-    ).fetchone()
-
-    if not user:
-
-        conn.close()
-
-        raise HTTPException(
-            status_code=404,
-            detail="User tidak ditemukan."
-        )
-
-    if not user["pki_public_key"]:
-
-        conn.close()
-
-        raise HTTPException(
-            status_code=400,
-            detail="PKI Public Key belum terdaftar."
-        )
-
-    # =====================================
-    # Verify RSA Signature
-    # =====================================
-
-    if not verify_pki_signature(
-        user["pki_public_key"],
-        data.nonce,
-        data.signature,
-    ):
-
-        conn.close()
-
-        raise HTTPException(
-            status_code=401,
-            detail="Signature tidak valid."
-        )
-
-    # =====================================
-    # Simpan Certificate Request
-    # =====================================
-
-    conn.execute(
-        """
-        INSERT INTO certificate_requests
-        (
-            username,
-            csr_pem,
-            status,
-            requested_at
-        )
-        VALUES
-        (?, ?, 'PENDING', ?)
-        """,
-        (
-            username,
-            "PROOF_OF_POSSESSION_OK",
-            now_iso(),
-        ),
-    )
-
-    # =====================================
-    # Hapus challenge (anti replay)
-    # =====================================
-
-    conn.execute(
-        """
-        DELETE FROM certificate_challenges
-        WHERE username=?
-        """,
-        (
-            username,
-        ),
-    )
-
-    conn.commit()
-
-    conn.close()
-
-    return {
-        "ok": True,
-        "message": "Proof of Possession berhasil diverifikasi."
-    }
 
 @app.post("/api/upload/start")
 def upload_start(

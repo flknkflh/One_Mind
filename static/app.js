@@ -29,17 +29,13 @@ const dippSession = {
 
 };
 
-const pkiSession = {
+const rsaEnrollmentSession = {
 
     privateKey: null,
 
     publicKey: null,
 
-    username: null,
-
-    csr: null,
-
-    certificate: null
+    username: null
 
 };
 
@@ -130,8 +126,6 @@ function bytesToB64(bytes) {
 }
 
 function b64ToBytes(text) {
-
-    console.log("BASE64 INPUT =", text);
 
     const binary = atob(text);
 
@@ -244,11 +238,6 @@ async function api(path, options = {}) {
 
     const data = await res.json().catch(() => ({}));
 
-    // ============================
-    // DEBUG
-    // ============================
-    console.log("API:", path);
-    console.log(data);
 
     if (!res.ok) {
 
@@ -273,6 +262,36 @@ async function api(path, options = {}) {
 
 }
 
+async function pendingLoginApi(
+    path,
+    loginToken,
+    options = {}
+) {
+    const headers = {
+        "Content-Type": "application/json",
+        ...(options.headers || {}),
+        Authorization: `Bearer ${loginToken}`
+    };
+
+    const res = await fetch(path, {
+        ...options,
+        headers
+    });
+
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+        throw new Error(
+            "HTTP " +
+            res.status +
+            "\n\n" +
+            JSON.stringify(data, null, 2)
+        );
+    }
+
+    return data;
+}
+
 async function adminApi(path, options = {}) {
 
     const headers = {
@@ -293,9 +312,6 @@ async function adminApi(path, options = {}) {
     );
 
     const data = await res.json().catch(() => ({}));
-
-    console.log("ADMIN API:", path);
-    console.log(data);
 
     if (!res.ok) {
 
@@ -490,11 +506,11 @@ async function generatePKIKeypair() {
 
     );
 
-    pkiSession.privateKey = pair.privateKey;
+    rsaEnrollmentSession.privateKey = pair.privateKey;
 
-    pkiSession.publicKey = pair.publicKey;
+    rsaEnrollmentSession.publicKey = pair.publicKey;
 
-    pkiSession.username = state.username;
+    rsaEnrollmentSession.username = state.username;
 
     return pair;
 
@@ -514,9 +530,28 @@ function arrayBufferToBase64(buffer) {
 
 }
 
+function base64ToArrayBuffer(base64) {
+
+    const binary = atob(base64);
+
+    const bytes = new Uint8Array(
+        binary.length
+    );
+
+    for (let i = 0; i < binary.length; i++) {
+
+        bytes[i] =
+            binary.charCodeAt(i);
+
+    }
+
+    return bytes.buffer;
+
+}
+
 async function signChallenge(nonceHex) {
 
-    if (!pkiSession.privateKey) {
+    if (!rsaEnrollmentSession.privateKey) {
         throw new Error("PKI Private Key belum tersedia.");
     }
 
@@ -526,7 +561,7 @@ async function signChallenge(nonceHex) {
         {
             name: "RSASSA-PKCS1-v1_5"
         },
-        pkiSession.privateKey,
+        rsaEnrollmentSession.privateKey,
         nonceBytes
     );
 
@@ -536,7 +571,7 @@ async function signChallenge(nonceHex) {
 
 async function exportPKIPrivateKey() {
 
-    if (!pkiSession.privateKey) {
+    if (!rsaEnrollmentSession.privateKey) {
 
         throw new Error(
             "PKI Private Key belum tersedia."
@@ -548,7 +583,7 @@ async function exportPKIPrivateKey() {
 
         "pkcs8",
 
-        pkiSession.privateKey
+        rsaEnrollmentSession.privateKey
 
     );
 
@@ -556,54 +591,258 @@ async function exportPKIPrivateKey() {
 
 }
 
-function downloadPKIPrivateKey(
 
-    username,
-
-    bytes
-
+async function exportRSAEnrollmentKey(
+    username
 ) {
+
+    if (!rsaEnrollmentSession.privateKey) {
+
+        throw new Error(
+            "RSA Login Private Key belum tersedia."
+        );
+
+    }
+
+    const privateKey =
+        await exportPKIPrivateKey();
+
+    const identity = {
+
+        version: 1,
+
+        type: "ONE_MIND_RSA_ENROLLMENT",
+
+        username,
+
+        created_at:
+            new Date().toISOString(),
+
+        public_key:
+            await exportPKIPublicKey(),
+
+        private_key:
+            arrayBufferToBase64(
+                privateKey.buffer
+            )
+
+    };
 
     const blob = new Blob(
 
-        [bytes],
+        [
+            JSON.stringify(
+                identity,
+                null,
+                2
+            )
+        ],
 
         {
-
-            type: "application/octet-stream"
-
+            type:
+                "application/json"
         }
 
     );
 
-    const url = URL.createObjectURL(blob);
+    const url =
+        URL.createObjectURL(
+            blob
+        );
 
-    const a = document.createElement("a");
+    const a =
+        document.createElement(
+            "a"
+        );
 
     a.href = url;
 
-    a.download = `${username}.key`;
+    a.download =
+        `ONE_MIND_RSA_${username}.key`;
 
     a.click();
 
-    URL.revokeObjectURL(url);
-
-}
-
-async function exportPKIIdentity() {
-
-    const bytes =
-        await exportPKIPrivateKey();
-
-    downloadPKIPrivateKey(
-
-        state.username,
-
-        bytes
-
+    URL.revokeObjectURL(
+        url
     );
 
 }
+
+function pemToArrayBuffer(
+    pem
+) {
+
+    const base64 = pem
+
+        .replace(
+            "-----BEGIN PUBLIC KEY-----",
+            ""
+        )
+
+        .replace(
+            "-----END PUBLIC KEY-----",
+            ""
+        )
+
+        .replace(/\s/g, "");
+
+    return base64ToArrayBuffer(
+        base64
+    );
+
+}
+
+
+async function requestRSAEnrollmentKey(
+    expectedUsername
+) {
+    return new Promise((resolve, reject) => {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = ".key";
+
+        input.onchange = async () => {
+            const file = input.files?.[0];
+
+            if (!file) {
+                reject(new Error("RSA Login Key tidak dipilih."));
+                return;
+            }
+
+            try {
+                await importRSAEnrollmentKey(file, expectedUsername);
+                resolve();
+            }
+            catch (err) {
+                reject(err);
+            }
+        };
+
+        input.click();
+    });
+}
+
+
+async function importRSAEnrollmentKey(
+    file,
+    expectedUsername = state.username
+) {
+
+    const text =
+        await file.text();
+
+    const identity =
+        JSON.parse(text);
+
+    if (
+        identity.type !==
+        "ONE_MIND_RSA_ENROLLMENT"
+    ) {
+
+        throw new Error(
+            "File RSA Login tidak valid."
+        );
+
+    }
+
+    if (
+        expectedUsername &&
+        identity.username !== expectedUsername
+    ) {
+        throw new Error(
+            "RSA Login Key bukan milik user ini."
+        );
+    }
+
+    if (
+        !identity.private_key
+    ) {
+
+        throw new Error(
+            "Private Key tidak ditemukan pada RSA Login Key."
+        );
+
+    }
+
+    if (
+        !identity.public_key
+    ) {
+
+        throw new Error(
+            "Public Key tidak ditemukan pada RSA Login Key."
+        );
+
+    }
+
+    const privateKey =
+        await crypto.subtle.importKey(
+
+            "pkcs8",
+
+            base64ToArrayBuffer(
+                identity.private_key
+            ),
+
+            {
+
+                name:
+                    "RSASSA-PKCS1-v1_5",
+
+                hash:
+                    PKI_HASH
+
+            },
+
+            true,
+
+            [
+
+                "sign"
+
+            ]
+
+        );
+
+    const publicKey =
+        await crypto.subtle.importKey(
+
+            "spki",
+
+            pemToArrayBuffer(
+                identity.public_key
+            ),
+
+            {
+
+                name:
+                    "RSASSA-PKCS1-v1_5",
+
+                hash:
+                    PKI_HASH
+
+            },
+
+            true,
+
+            [
+
+                "verify"
+
+            ]
+
+        );
+
+    rsaEnrollmentSession.privateKey =
+        privateKey;
+
+    rsaEnrollmentSession.publicKey =
+        publicKey;
+
+    rsaEnrollmentSession.username =
+        identity.username;
+
+}
+
 
 function dippWrapBytes(publicKey, keyBytes) {
   const params = {
@@ -659,61 +898,15 @@ function dippUnwrapBytes(privateEntry, wrapped) {
   return bitsToBytes(bits);
 }
 
-/*
-async function createKeyBundle(username) {
-
-    // ============================
-    // Generate DIPP
-    // ============================
-
-    const dipp = generateDippKeypair();
-
-    // ============================
-    // Generate RSA PKI
-    // ============================
-
-    await generatePKIKeypair();
-
-    // ============================
-    // Simpan DIPP di RAM
-    // ============================
-
-    dippSession.privateKey = dipp;
-    dippSession.publicKey = dipp.public;
-    dippSession.username = username;
-
-    state.unlockedPrivateKey = dipp;
-
-    // ============================
-    // Export Identitas DIPP
-    // ============================
-
-    await exportDippIdentity(
-        username,
-        dipp
-    );
-
-    // ============================
-    // Return seluruh bundle
-    // ============================
-
-    return {
-        dippPublic: dipp.public,
-        pkiPublicKey: pkiSession.publicKey
-    };
-
-}
-*/
-
 async function exportPKIPublicKey() {
 
-    if (!pkiSession.publicKey) {
+    if (!rsaEnrollmentSession.publicKey) {
         throw new Error("PKI Public Key belum tersedia.");
     }
 
     const spki = await crypto.subtle.exportKey(
         "spki",
-        pkiSession.publicKey
+        rsaEnrollmentSession.publicKey
     );
 
     const bytes = new Uint8Array(spki);
@@ -1272,29 +1465,19 @@ async function deleteFile(fileId) {
 
 async function updateFileWithRotation(fileId, replacementFile) {
 
-    console.log("1. UPDATE START");
-
     if (!replacementFile || !replacementFile.size)
         return;
 
-    console.log("2. FILE OK");
-
     const current = await getFileKey(fileId);
-
-    console.log("3. GET FILE OK");
 
     await decryptEnvelope(
         current.file.envelope,
         current.fileKey
     );
 
-    console.log("4. DECRYPT OK");
-
     const encrypted = await encryptFile(
         replacementFile
     );
-
-    console.log("5. ENCRYPT OK");
 
     encrypted.envelope.ciphertext_b64 =
         bytesToB64(encrypted.ciphertext);
@@ -1308,17 +1491,11 @@ async function updateFileWithRotation(fileId, replacementFile) {
     encrypted.envelope.version =
         (current.file.envelope.version || 1) + 1;
 
-    console.log("6. ENVELOPE READY");
-
     const wrapped_keys =
         await wrapKeyForAccess(
             encrypted.key,
             fileId
         );
-
-    console.log("7. WRAP OK");
-
-    console.log("8. SEND PUT");
 
     await api(
         `/api/files/${fileId}`,
@@ -1332,11 +1509,7 @@ async function updateFileWithRotation(fileId, replacementFile) {
         }
     );
 
-    console.log("9. PUT SUCCESS");
-
     await refreshAll();
-
-    console.log("10. REFRESH OK");
 
     showNotice("Update selesai.");
 }
@@ -1381,15 +1554,6 @@ async function rotateCurrentFileKey(fileId) {
         current.file.envelope.uploaded_at;
 
     // =====================================
-
-    console.log("========== UPDATE ENVELOPE ==========");
-    console.log(encrypted.envelope);
-    console.log(Object.keys(encrypted.envelope));
-    console.log(
-        "ciphertext length =",
-        encrypted.envelope.ciphertext_b64?.length
-    );
-    console.log("=====================================");
 
     const wrapped_keys = await wrapKeyForAccess(
         encrypted.key,
@@ -2197,7 +2361,9 @@ on("registerForm", "submit", async (evt) => {
 
     evt.preventDefault();
 
-    const form = new FormData(evt.currentTarget);
+    const formElement = evt.currentTarget;
+
+    const form = new FormData(formElement);
 
     const username = form.get("username").trim();
 
@@ -2210,22 +2376,23 @@ on("registerForm", "submit", async (evt) => {
     const dipp = generateDippKeypair();
 
     // ============================
-    // Generate PKI RSA Keypair
+    // Generate RSA Login Keypair
     // ============================
 
     await generatePKIKeypair();
 
     // ============================
-    // Export PKI Public Key
+    // Export RSA Login Public Key
     // ============================
 
-    const pkiPublicKey = await exportPKIPublicKey();
+    const rsaEnrollmentPublicKey =
+        await exportPKIPublicKey();
 
     // ============================
     // Register ke Server
     // ============================
 
-    const result = await api(
+    await api(
         "/api/register",
         {
             method: "POST",
@@ -2233,28 +2400,34 @@ on("registerForm", "submit", async (evt) => {
 
                 username,
 
-                display_name: form.get("display_name").trim(),
+                display_name:
+                    form.get("display_name").trim(),
 
                 password,
 
-                nip: form.get("nip").trim(),
+                nip:
+                    form.get("nip").trim(),
 
-                rank: form.get("rank").trim(),
+                rank:
+                    form.get("rank").trim(),
 
-                position: form.get("position").trim(),
+                position:
+                    form.get("position").trim(),
 
                 // DIPP Public Key
-                public_key: dipp.public,
+                public_key:
+                    dipp.public,
 
-                // PKI RSA Public Key
-                pki_public_key: pkiPublicKey
+                // RSA Login Public Key
+                pki_public_key:
+                    rsaEnrollmentPublicKey
 
             }),
         }
     );
 
     // ============================
-    // Simpan DIPP ke RAM
+    // Simpan DIPP Session
     // ============================
 
     dippSession.privateKey = dipp;
@@ -2266,16 +2439,18 @@ on("registerForm", "submit", async (evt) => {
     state.unlockedPrivateKey = dipp;
 
     // ============================
-    // Lengkapi informasi PKI
+    // Simpan RSA Login Session
     // ============================
 
-    pkiSession.username = username;
+    rsaEnrollmentSession.username = username;
 
     // ============================
-    // Export Identitas DIPP
+    // Export Identity
     // ============================
 
-    let exportSuccess = false;
+    let dippExport = false;
+
+    let pkiExport = false;
 
     try {
 
@@ -2284,7 +2459,7 @@ on("registerForm", "submit", async (evt) => {
             dipp
         );
 
-        exportSuccess = true;
+        dippExport = true;
 
     } catch (err) {
 
@@ -2295,37 +2470,88 @@ on("registerForm", "submit", async (evt) => {
 
     }
 
+    try {
+
+        await exportRSAEnrollmentKey(
+            username
+        );
+
+        pkiExport = true;
+
+    } catch (err) {
+
+        console.error(
+            "Export RSA Login Key gagal:",
+            err
+        );
+
+    }
+
     // ============================
     // Notifikasi
     // ============================
 
-    if (exportSuccess) {
+    if (dippExport && pkiExport) {
 
         showNotice(
-            "Registrasi berhasil.\n\nIdentitas DIPP telah berhasil diunduh.\nSimpan file tersebut dengan aman.\n\nAkun masih PENDING dan menunggu approval administrator sebelum bisa login."
+            "Registrasi berhasil.\n\nIdentitas DIPP dan RSA Login Key berhasil diunduh.\nSimpan kedua file tersebut di tempat yang aman.\n\nAkun masih PENDING dan menunggu approval Administrator.\n\nRSA Login Key wajib digunakan pada setiap login dan juga mengaktifkan certificate pada login pertama."
+        );
+
+    } else if (dippExport) {
+
+        showNotice(
+            "Registrasi berhasil.\n\nIdentitas DIPP berhasil diunduh namun RSA Login Key gagal diunduh.\n\nJangan tutup browser sebelum RSA Login Key berhasil diekspor."
+        );
+
+    } else if (pkiExport) {
+
+        showNotice(
+            "Registrasi berhasil.\n\nRSA Login Key berhasil diunduh namun Identitas DIPP gagal diunduh.\n\nJangan tutup browser sebelum Identitas DIPP berhasil diekspor."
         );
 
     } else {
 
         showNotice(
-            "Registrasi berhasil.\n\nNamun Identitas DIPP GAGAL diunduh.\n\nAkun masih PENDING dan menunggu approval administrator. JANGAN tutup browser ini jika perlu mencoba export ulang."
+            "Registrasi berhasil.\n\nNamun export Identitas DIPP maupun RSA Login Key gagal.\n\nJangan tutup browser sebelum kedua file berhasil diekspor."
         );
 
     }
 
-    evt.currentTarget.reset();
+    formElement.reset();
 
     renderAuth();
 
 });
 
+on(
+    "importRsaInput",
+    "change",
+    async (evt) => {
+        const input = evt.currentTarget;
+        const file = input?.files?.[0];
+
+        if (!file) return;
+
+        try {
+            await importRSAEnrollmentKey(file, state.username);
+            showNotice("RSA Login Key berhasil dimuat ke RAM.");
+        }
+        catch (err) {
+            console.error(err);
+            showNotice(err.message);
+        }
+
+        input.value = "";
+    }
+);
+
 on("importDippInput", "change", async (evt) => {
 
-    const file = evt.currentTarget.files[0];
+    const input = evt.currentTarget;
 
-    if (!file || !state.username) {
-        return;
-    }
+    const file = input.files?.[0];
+
+    if (!file) return;
 
     try {
 
@@ -2334,15 +2560,13 @@ on("importDippInput", "change", async (evt) => {
             state.username
         );
 
-        updateLocalKeyStatus();
-
         showNotice(
-            "Identitas DIPP berhasil diimport."
+            "Identitas DIPP berhasil dimuat."
         );
 
-    }
+        updateLocalKeyStatus();
 
-    catch (err) {
+    } catch (err) {
 
         console.error(err);
 
@@ -2350,91 +2574,125 @@ on("importDippInput", "change", async (evt) => {
 
     }
 
-    finally {
-
-        if (evt.currentTarget) {
-            evt.currentTarget.value = "";
-        }
-
-    }
+    input.value = "";
 
 });
 
 on("loginForm", "submit", async (evt) => {
 
-  evt.preventDefault();
+    evt.preventDefault();
 
-  const form = new FormData(evt.currentTarget);
+    const formElement = evt.currentTarget;
+    const form = new FormData(formElement);
+    const username = form.get("username").trim();
+    const password = form.get("password");
 
-  const username = form.get("username").trim();
-
-  const password = form.get("password");
-
-  // ============================
-  // Pastikan file DIPP dipilih
-  // ============================
-
-  if (!selectedDippFile) {
-
-    showNotice(
-      "Silakan pilih file Identitas DIPP terlebih dahulu."
-    );
-
-    return;
-
-  }
-
-  // ============================
-  // Login ke Server
-  // ============================
-
-  const result = await api(
-    "/api/login",
-    {
-      method: "POST",
-      body: JSON.stringify({
-        username,
-        password
-      })
+    if (!selectedDippFile) {
+        showNotice(
+            "Silakan pilih file Identitas DIPP terlebih dahulu."
+        );
+        return;
     }
-  );
 
-  state.token = result.token;
+    try {
+        // DIPP tetap menjadi identitas untuk seluruh operasi di aplikasi.
+        await importDippIdentity(
+            selectedDippFile,
+            username
+        );
 
-  state.username = result.username;
+        // Tahap password: server hanya memberi token login sementara.
+        const started = await api(
+            "/api/login",
+            {
+                method: "POST",
+                body: JSON.stringify({
+                    username,
+                    password
+                })
+            }
+        );
 
-  localStorage.setItem(
-    "om_token",
-    state.token
-  );
+        // RSA Login Key wajib pada login pertama maupun login berikutnya.
+        await requestRSAEnrollmentKey(username);
 
-  localStorage.setItem(
-    "om_username",
-    state.username
-  );
+        const challenge = await pendingLoginApi(
+            "/api/login/challenge",
+            started.login_token,
+            { method: "POST" }
+        );
 
-  localStorage.removeItem(
-    "om_last_password_hint"
-  );
+        const signature = await signChallenge(
+            challenge.nonce
+        );
 
-  // ============================
-  // Import Identitas DIPP
-  // ============================
+        const publicKey = await exportPKIPublicKey();
 
-  await importDippIdentity(
-    selectedDippFile,
-    username
-  );
+        const verified = await pendingLoginApi(
+            "/api/login/verify",
+            started.login_token,
+            {
+                method: "POST",
+                body: JSON.stringify({
+                    nonce: challenge.nonce,
+                    signature,
+                    public_key_pem: publicKey
+                })
+            }
+        );
 
-  renderAuth();
+        // JWT utama baru disimpan setelah RSA challenge berhasil.
+        state.token = verified.token;
+        state.username = verified.username;
 
-  await refreshAll();
+        localStorage.setItem("om_token", state.token);
+        localStorage.setItem("om_username", state.username);
+        localStorage.removeItem("om_last_password_hint");
 
-  updateLocalKeyStatus();
+        renderAuth();
+        await refreshAll();
+        updateLocalKeyStatus();
 
-  showNotice(
-    "Login berhasil."
-  );
+        if (verified.certificate_issued) {
+            showNotice(
+                "Login berhasil.\n\nRSA challenge valid dan certificate akun berhasil diaktifkan."
+            );
+        }
+        else {
+            showNotice(
+                "Login berhasil.\n\nRSA challenge valid dan certificate akun aktif."
+            );
+        }
+
+        formElement.reset();
+        selectedDippFile = null;
+    }
+    catch (err) {
+        console.error(err);
+
+        state.token = null;
+        state.username = null;
+        state.unlockedPrivateKey = null;
+
+        dippSession.privateKey = null;
+        dippSession.publicKey = null;
+        dippSession.username = null;
+
+        rsaEnrollmentSession.privateKey = null;
+        rsaEnrollmentSession.publicKey = null;
+        rsaEnrollmentSession.username = null;
+
+        localStorage.removeItem("om_token");
+        localStorage.removeItem("om_username");
+
+        renderAuth();
+        updateLocalKeyStatus();
+
+        showNotice(
+            err.message ||
+            "Login dibatalkan karena DIPP atau RSA Login Key tidak valid."
+        );
+    }
 
 });
 
@@ -2483,8 +2741,6 @@ on("uploadForm", "submit", async (evt) => {
             encrypted,
             wrapped
         );
-
-        console.log(result);
 
         showNotice("Upload selesai.");
 
@@ -2639,55 +2895,45 @@ on("updateFileInput", "change", async (evt) => {
 
 });
 
-on("exportDippBtn", "click", async () => {
+on(
+    "exportRsaBtn",
+    "click",
+    async () => {
 
-    if (!state.username) {
+        if (!state.username) {
 
-        showNotice(
-            "Silakan login terlebih dahulu."
-        );
+            showNotice(
+                "Login terlebih dahulu."
+            );
 
-        return;
+            return;
 
-    }
+        }
 
-    if (!dippSession.privateKey) {
+        try {
 
-        showNotice(
-            "Identitas DIPP belum tersedia di RAM."
-        );
+            await exportRSAEnrollmentKey(
+                state.username
+            );
 
-        return;
+            showNotice(
+                "RSA Login Key berhasil diekspor."
+            );
 
-    }
+        }
 
-    try {
+        catch (err) {
 
-        await exportDippIdentity(
+            console.error(err);
 
-            state.username,
+            showNotice(
+                err.message
+            );
 
-            dippSession.privateKey
-
-        );
-
-        showNotice(
-            "Identitas DIPP berhasil diexport."
-        );
-
-    }
-
-    catch (err) {
-
-        console.error(err);
-
-        showNotice(
-            "Export Identitas DIPP gagal."
-        );
+        }
 
     }
-
-});
+);
 
 on("logoutBtn", "click", () => {
 
@@ -2703,11 +2949,9 @@ on("logoutBtn", "click", () => {
   // Hapus PKI dari RAM
   // ============================
 
-  pkiSession.privateKey = null;
-  pkiSession.publicKey = null;
-  pkiSession.username = null;
-  pkiSession.csr = null;
-  pkiSession.certificate = null;
+  rsaEnrollmentSession.privateKey = null;
+  rsaEnrollmentSession.publicKey = null;
+  rsaEnrollmentSession.username = null;
 
   // ============================
   // Hapus session login
@@ -2734,6 +2978,7 @@ renderAuth();
 refreshAll();
 refreshAdminSetupStatus();
 refreshAdminDashboard();
+
 on("dippFile", "change", (evt) => {
 
     selectedDippFile = evt.target.files[0] || null;
