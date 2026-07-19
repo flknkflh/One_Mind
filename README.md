@@ -7,6 +7,7 @@ Dokumentasi:
 - [Manual sistem](docs/MANUAL_BOOK.md)
 - [Catatan keamanan](docs/SECURITY.md)
 - [Panduan TLS dan deployment](docs/TLS_MIGRATION.md)
+- [Deployment khusus jaringan kantor](docs/OFFICE_DEPLOYMENT.md)
 - [Audit riwayat remote](docs/REMOTE_HISTORY_AUDIT.md)
 - [Konteks implementasi](Prompt.md)
 

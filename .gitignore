@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 !.env.production.example
+!.env.office.example
 
 # Runtime application data
 data/

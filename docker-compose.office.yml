@@ -1,0 +1,50 @@
+services:
+  one-mind:
+    build:
+      context: .
+      target: production
+    container_name: one_mind_office
+    init: true
+    ports:
+      - "${ONE_MIND_BIND_IP:-0.0.0.0}:${ONE_MIND_HTTPS_PORT:-8443}:8443"
+    environment:
+      ONE_MIND_DATA_DIR: /app/data
+      ONE_MIND_CERT_DIR: /app/certs
+      ONE_MIND_HOST: 0.0.0.0
+      ONE_MIND_PORT: 8443
+      ONE_MIND_TLS_MODE: internal
+      ONE_MIND_ALLOWED_HOSTS: ${ONE_MIND_ALLOWED_HOSTS:?ONE_MIND_ALLOWED_HOSTS wajib diisi}
+      ONE_MIND_PKI_AUTO_INIT: ${ONE_MIND_PKI_AUTO_INIT:-false}
+      ONE_MIND_SESSION_SECONDS: ${ONE_MIND_SESSION_SECONDS:-43200}
+      ONE_MIND_ADMIN_SESSION_SECONDS: ${ONE_MIND_ADMIN_SESSION_SECONDS:-43200}
+      ONE_MIND_LOGIN_MAX_FAILURES: ${ONE_MIND_LOGIN_MAX_FAILURES:-8}
+      ONE_MIND_LOGIN_WINDOW_SECONDS: ${ONE_MIND_LOGIN_WINDOW_SECONDS:-600}
+      ONE_MIND_ARGON2_TIME_COST: ${ONE_MIND_ARGON2_TIME_COST:-3}
+      ONE_MIND_ARGON2_MEMORY_KIB: ${ONE_MIND_ARGON2_MEMORY_KIB:-65536}
+      ONE_MIND_ARGON2_PARALLELISM: ${ONE_MIND_ARGON2_PARALLELISM:-4}
+    volumes:
+      - ./data:/app/data
+      - ./certs:/app/certs:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    cpus: ${ONE_MIND_CPU_LIMIT:-2.0}
+    mem_limit: ${ONE_MIND_MEMORY_LIMIT:-1g}
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --show-error --insecure https://127.0.0.1:8443/health >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    restart: unless-stopped
+    stop_grace_period: 30s
