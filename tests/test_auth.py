@@ -1,23 +1,157 @@
 import base64
+import hashlib
+import json
 import unittest
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from fastapi import HTTPException
+from pydantic import ValidationError
+from starlette.requests import Request
 
 from app import main
+from app.auth import passwords
 
 
 class PasswordBaselineTests(unittest.TestCase):
+    @staticmethod
+    def legacy_hash(password: str) -> str:
+        salt = b"legacy-test-salt"
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt,
+            passwords.LEGACY_PBKDF2_ITERATIONS,
+        )
+        salt_text = base64.b64encode(salt).decode("ascii")
+        digest_text = base64.b64encode(digest).decode("ascii")
+        return (
+            f"pbkdf2_sha256${passwords.LEGACY_PBKDF2_ITERATIONS}$"
+            f"{salt_text}${digest_text}"
+        )
+
     def test_password_hash_round_trip(self):
         encoded = main.hash_password("contoh-password-kuat")
 
         self.assertTrue(main.verify_password("contoh-password-kuat", encoded))
         self.assertFalse(main.verify_password("password-salah", encoded))
-        self.assertTrue(encoded.startswith("pbkdf2_sha256$"))
+        self.assertTrue(encoded.startswith("$argon2id$"))
+
+    def test_argon2id_uses_unique_salt(self):
+        first = main.hash_password("contoh-password-kuat")
+        second = main.hash_password("contoh-password-kuat")
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(main.verify_password("contoh-password-kuat", first))
+        self.assertTrue(main.verify_password("contoh-password-kuat", second))
 
     def test_malformed_password_hash_is_rejected(self):
         self.assertFalse(main.verify_password("password", "bukan-hash-valid"))
+
+    def test_legacy_pbkdf2_is_migrated_to_argon2id(self):
+        legacy = self.legacy_hash("password-lama-yang-kuat")
+
+        valid, replacement = passwords.verify_and_rehash(
+            "password-lama-yang-kuat",
+            legacy,
+        )
+
+        self.assertTrue(valid)
+        self.assertIsNotNone(replacement)
+        self.assertTrue(replacement.startswith("$argon2id$"))
+        self.assertTrue(main.verify_password("password-lama-yang-kuat", replacement))
+
+    def test_admin_login_persists_legacy_rehash(self):
+        username = "legacy-admin"
+        password = "password-lama-yang-kuat"
+        conn = main.db()
+        conn.execute("DELETE FROM administrators WHERE username=?", (username,))
+        conn.execute(
+            "INSERT INTO administrators (username, password_hash, created_at) VALUES (?, ?, ?)",
+            (username, self.legacy_hash(password), main.now_iso()),
+        )
+        conn.commit()
+        conn.close()
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/admin/login",
+                "headers": [],
+                "client": ("127.0.0.1", 12345),
+            }
+        )
+        result = main.admin_login(
+            main.AdminLoginIn(username=username, password=password),
+            request,
+        )
+
+        conn = main.db()
+        stored = conn.execute(
+            "SELECT password_hash FROM administrators WHERE username=?",
+            (username,),
+        ).fetchone()["password_hash"]
+        conn.close()
+
+        self.assertEqual(result["username"], username)
+        self.assertTrue(stored.startswith("$argon2id$"))
+
+    def test_user_login_persists_legacy_rehash(self):
+        username = "legacy-user"
+        password = "password-lama-yang-kuat"
+        conn = main.db()
+        conn.execute("DELETE FROM users WHERE username=?", (username,))
+        conn.execute(
+            """
+            INSERT INTO users (
+                username, display_name, password_hash, nip, rank, position,
+                public_key, pki_public_key, account_status,
+                certificate_status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 'NONE', ?)
+            """,
+            (
+                username,
+                username,
+                self.legacy_hash(password),
+                "NIP-LEGACY",
+                "TEST",
+                "TEST",
+                json.dumps({"algorithm": "test"}),
+                "PUBLIC-KEY-PLACEHOLDER",
+                main.now_iso(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/login",
+                "headers": [],
+                "client": ("127.0.0.1", 12346),
+            }
+        )
+        result = main.login(
+            main.LoginIn(username=username, password=password),
+            request,
+        )
+
+        conn = main.db()
+        stored = conn.execute(
+            "SELECT password_hash FROM users WHERE username=?",
+            (username,),
+        ).fetchone()["password_hash"]
+        conn.close()
+
+        self.assertEqual(result["username"], username)
+        self.assertTrue(stored.startswith("$argon2id$"))
+
+    def test_new_password_policy_rejects_short_password(self):
+        with self.assertRaises(ValidationError):
+            main.AdminSetupIn(username="admin-office", password="pendek123")
 
 
 class SessionTokenBaselineTests(unittest.TestCase):

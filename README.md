@@ -56,7 +56,7 @@ Browser membuat dua identitas:
 - keypair DIPP untuk membungkus AES file key;
 - keypair RSA 4096-bit untuk proof-of-possession saat login.
 
-Server menerima data identitas, DIPP public key, RSA public key, serta password melalui HTTPS. Password disimpan sebagai hash PBKDF2-SHA-256. Akun baru berstatus `PENDING` sampai diproses administrator.
+Server menerima data identitas, DIPP public key, RSA public key, serta password melalui HTTPS. Password baru disimpan sebagai hash Argon2id. Hash PBKDF2-SHA-256 lama tetap dapat diverifikasi dan otomatis diganti Argon2id setelah login yang valid. Akun baru berstatus `PENDING` sampai diproses administrator.
 
 Browser mengekspor dua file identitas pengguna. Pada implementasi saat ini, private key di dalam file tersebut **belum dienkripsi dengan password**. File harus diperlakukan sebagai secret berisiko tinggi.
 

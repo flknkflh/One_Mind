@@ -32,7 +32,7 @@ CSP membantu membatasi injeksi, tetapi tidak melindungi dari JavaScript resmi ya
 
 ### Pengguna
 
-1. Password diverifikasi memakai PBKDF2-HMAC-SHA-256 pada server.
+1. Password diverifikasi memakai Argon2id pada server. Hash PBKDF2-HMAC-SHA-256 lama dimigrasikan otomatis setelah autentikasi yang valid.
 2. Server menerbitkan pending-login token berumur pendek.
 3. Browser meminta nonce dan menandatanganinya memakai RSA Login private key.
 4. Server memverifikasi RSA signature dan kecocokan public key.

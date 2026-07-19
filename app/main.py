@@ -20,6 +20,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from app.auth.passwords import (
+    PASSWORD_MAX_LENGTH,
+    PASSWORD_MIN_LENGTH,
+    hash_password,
+    verify_and_rehash,
+    verify_password,
+)
 from app.pki.pki import (
     certificate_matches_current_intermediate,
     initialize_pki,
@@ -36,7 +43,6 @@ STORAGE_DIR = DATA_DIR / "storage"
 TEMP_UPLOAD_DIR = DATA_DIR / "temp_uploads"
 SECRET_PATH = DATA_DIR / "keys" / "server_secret.bin"
 
-PBKDF2_ITERATIONS = 390_000
 SESSION_SECONDS = int(os.environ.get("ONE_MIND_SESSION_SECONDS", "43200"))
 ADMIN_SESSION_SECONDS = int(os.environ.get("ONE_MIND_ADMIN_SESSION_SECONDS", "43200"))
 PENDING_LOGIN_SECONDS = int(os.environ.get("ONE_MIND_PENDING_LOGIN_SECONDS", "300"))
@@ -161,25 +167,6 @@ def get_secret() -> bytes:
     if len(value) < 32:
         raise RuntimeError("Server signing secret tidak valid atau terlalu pendek.")
     return value
-
-
-def hash_password(password: str, salt: bytes | None = None) -> str:
-    salt = salt or secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
-    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${b64e(salt)}${b64e(digest)}"
-
-
-def verify_password(password: str, encoded: str) -> bool:
-    try:
-        algo, iterations, salt_b64, digest_b64 = encoded.split("$", 3)
-        if algo != "pbkdf2_sha256":
-            return False
-        salt = b64d(salt_b64)
-        expected = b64d(digest_b64)
-        candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
-        return hmac.compare_digest(candidate, expected)
-    except Exception:
-        return False
 
 
 def sign_token(username: str) -> str:
@@ -825,7 +812,10 @@ class RegisterIn(BaseModel):
 
     username: str
     display_name: str
-    password: str
+    password: str = Field(
+        min_length=PASSWORD_MIN_LENGTH,
+        max_length=PASSWORD_MAX_LENGTH,
+    )
     # Identitas Personel
     nip: str
     rank: str
@@ -836,7 +826,7 @@ class RegisterIn(BaseModel):
     pki_public_key: str
 class LoginIn(BaseModel):
     username: str
-    password: str
+    password: str = Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)
 
 
 class LoginVerifyIn(BaseModel):
@@ -847,17 +837,23 @@ class LoginVerifyIn(BaseModel):
 
 class AdminSetupIn(BaseModel):
     username: str = Field(min_length=3, max_length=80)
-    password: str = Field(min_length=8)
+    password: str = Field(
+        min_length=PASSWORD_MIN_LENGTH,
+        max_length=PASSWORD_MAX_LENGTH,
+    )
 
 
 class AdminLoginIn(BaseModel):
     username: str
-    password: str
+    password: str = Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)
 
 
 class AdminPasswordChangeIn(BaseModel):
-    current_password: str
-    new_password: str = Field(min_length=8)
+    current_password: str = Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)
+    new_password: str = Field(
+        min_length=PASSWORD_MIN_LENGTH,
+        max_length=PASSWORD_MAX_LENGTH,
+    )
 
 
 class AdminUserEditIn(BaseModel):
@@ -1048,11 +1044,26 @@ def admin_login(data: AdminLoginIn, request: Request):
             username,
         ),
     ).fetchone()
-    conn.close()
 
-    if not row or not verify_password(data.password, row["password_hash"]):
+    valid, replacement_hash = (
+        verify_and_rehash(data.password, row["password_hash"])
+        if row
+        else (False, None)
+    )
+
+    if not valid:
+        conn.close()
         record_login_failure(rate_key)
         raise HTTPException(status_code=401, detail="Username atau password admin salah.")
+
+    if replacement_hash:
+        conn.execute(
+            "UPDATE administrators SET password_hash=?, updated_at=? WHERE username=?",
+            (replacement_hash, now_iso(), row["username"]),
+        )
+        conn.commit()
+
+    conn.close()
 
     clear_login_failures(rate_key)
 
@@ -1614,7 +1625,13 @@ def login(
         (username,),
     ).fetchone()
 
-    if not row or not verify_password(data.password, row["password_hash"]):
+    valid, replacement_hash = (
+        verify_and_rehash(data.password, row["password_hash"])
+        if row
+        else (False, None)
+    )
+
+    if not valid:
         conn.close()
         record_login_failure(rate_key)
         raise HTTPException(
@@ -1622,8 +1639,18 @@ def login(
             detail="Username atau password salah.",
         )
 
+    if replacement_hash:
+        conn.execute(
+            "UPDATE users SET password_hash=? WHERE username=?",
+            (replacement_hash, username),
+        )
+        conn.commit()
+
+    if row["account_status"] != "ACTIVE":
+        conn.close()
+        enforce_active_account(row["account_status"])
+
     clear_login_failures(rate_key)
-    enforce_active_account(row["account_status"])
 
     cert = conn.execute(
         """
