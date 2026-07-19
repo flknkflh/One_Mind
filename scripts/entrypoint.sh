@@ -1,6 +1,9 @@
 #!/usr/bin/env sh
 set -eu
 
+# File runtime yang dibuat proses aplikasi harus privat secara default.
+umask 077
+
 CERT_DIR="${ONE_MIND_CERT_DIR:-/app/certs}"
 CERT_PATH="$CERT_DIR/server.crt"
 KEY_PATH="$CERT_DIR/server.key"

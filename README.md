@@ -120,7 +120,7 @@ Server tidak dirancang menyimpan private key pengguna atau plaintext file. Namun
 - Private key di RAM belum memiliki timeout otomatis.
 - Password masih dikirim ke server melalui TLS; autentikasi belum memakai PAKE seperti OPAQUE/SRP.
 - DIPP-KEM adalah algoritma prototipe/custom dan belum boleh dianggap setara KEM standar yang diaudit.
-- Root CA key, intermediate CA key, TLS key, database, `server_secret.bin`, dan data runtime saat ini terlacak di Git. Jika repository pernah dibagikan, lakukan rotasi/revokasi seluruh secret terkait.
+- Root CA key, intermediate CA key, TLS key, database, `server_secret.bin`, dan data runtime pernah terlacak dalam riwayat Git. Material tersebut sudah dikeluarkan dari pelacakan branch produksi, tetapi seluruh secret terkait tetap wajib dirotasi sebelum deployment.
 - Rate limit login tersimpan in-memory dan reset saat proses/container restart.
 - TLS melindungi data saat transit, bukan dari server/operator yang menyajikan JavaScript berbahaya.
 
@@ -130,7 +130,7 @@ Gunakan `docker-compose.prod.yml` dan Caddy hanya setelah:
 
 1. menetapkan domain dan email ACME;
 2. membatasi `ONE_MIND_ALLOWED_HOSTS` ke hostname produksi;
-3. memindahkan seluruh secret dan data aktif keluar dari Git;
+3. memastikan seluruh secret dan data aktif berada di runtime volume/secret storage serta membersihkan riwayat Git lama;
 4. merotasi key yang pernah masuk repository;
 5. menyiapkan firewall, backup terenkripsi, logging, monitoring, dan rate limiting persisten;
 6. memperbaiki export private key agar terenkripsi;

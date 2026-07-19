@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app.pki.pki import issue_certificate
+from app.pki.pki import initialize_pki, issue_certificate
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -37,6 +37,12 @@ PENDING_LOGIN_SECONDS = int(os.environ.get("ONE_MIND_PENDING_LOGIN_SECONDS", "30
 LOGIN_WINDOW_SECONDS = int(os.environ.get("ONE_MIND_LOGIN_WINDOW_SECONDS", "600"))
 LOGIN_MAX_FAILURES = int(os.environ.get("ONE_MIND_LOGIN_MAX_FAILURES", "8"))
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get("ONE_MIND_ALLOWED_HOSTS", "*").split(",") if h.strip()]
+PKI_AUTO_INIT = os.environ.get("ONE_MIND_PKI_AUTO_INIT", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 FAILED_LOGINS: dict[str, list[float]] = {}
 ACCOUNT_STATUSES = ("PENDING", "ACTIVE", "REJECTED", "DELETED")
 CERTIFICATE_STATUSES = ("NONE", "ISSUED", "REVOKED", "EXPIRED", "REPLACED")
@@ -144,7 +150,11 @@ def get_secret() -> bytes:
     SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not SECRET_PATH.exists():
         SECRET_PATH.write_bytes(secrets.token_bytes(32))
-    return SECRET_PATH.read_bytes()
+        SECRET_PATH.chmod(0o600)
+    value = SECRET_PATH.read_bytes()
+    if len(value) < 32:
+        raise RuntimeError("Server signing secret tidak valid atau terlalu pendek.")
+    return value
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -866,6 +876,8 @@ async def security_headers(request: Request, call_next):
 
 @app.on_event("startup")
 def startup():
+    initialize_pki(auto_init=PKI_AUTO_INIT)
+    get_secret()
     conn = db()
     conn.close()
 

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from datetime import datetime, timedelta
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -12,7 +13,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 # PKI Folder
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parents[2]
+DATA_DIR = Path(os.environ.get("ONE_MIND_DATA_DIR", PROJECT_DIR / "data"))
+BASE_DIR = Path(os.environ.get("ONE_MIND_PKI_DIR", DATA_DIR / "pki"))
 
 ROOT_DIR = BASE_DIR / "root"
 INTERMEDIATE_DIR = BASE_DIR / "intermediate"
@@ -55,6 +58,7 @@ def save_private_key(path: Path, private_key):
     )
 
     path.write_bytes(pem)
+    path.chmod(0o600)
 
 
 def save_certificate(path: Path, certificate):
@@ -106,6 +110,11 @@ def generate_root_ca():
         print("Root CA sudah ada.")
 
         return
+
+    if ROOT_KEY.exists() or ROOT_CERT.exists():
+        raise RuntimeError(
+            "Material Root CA tidak lengkap. Pulihkan pasangan key/certificate dari backup atau lakukan rotasi terkontrol."
+        )
 
     print("Membuat Root CA...")
 
@@ -257,6 +266,11 @@ def generate_intermediate_ca():
 
         return
 
+    if INTERMEDIATE_KEY.exists() or INTERMEDIATE_CERT.exists():
+        raise RuntimeError(
+            "Material Intermediate CA tidak lengkap. Pulihkan pasangan key/certificate dari backup atau lakukan rotasi terkontrol."
+        )
+
     if not ROOT_KEY.exists() or not ROOT_CERT.exists():
 
         raise RuntimeError(
@@ -390,6 +404,30 @@ def generate_intermediate_ca():
     )
 
     print("Intermediate CA berhasil dibuat.")
+
+
+def initialize_pki(auto_init: bool = True):
+    """Pastikan material CA tersedia di storage runtime, bukan di source tree."""
+
+    required = (
+        ROOT_KEY,
+        ROOT_CERT,
+        INTERMEDIATE_KEY,
+        INTERMEDIATE_CERT,
+    )
+
+    if all(path.exists() for path in required):
+        return
+
+    if not auto_init:
+        missing = ", ".join(str(path) for path in required if not path.exists())
+        raise RuntimeError(
+            "PKI belum diprovisikan untuk deployment ini. File yang belum tersedia: "
+            f"{missing}"
+        )
+
+    generate_root_ca()
+    generate_intermediate_ca()
 
 from cryptography.hazmat.primitives.asymmetric import padding
 

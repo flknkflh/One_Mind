@@ -1,0 +1,71 @@
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+# Runtime application data
+data/
+runtime/
+certs/
+app/pki/root/
+app/pki/intermediate/
+app/pki/issued/
+app/pki/csr/
+app/pki/revoked/
+
+# Databases and generated storage
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Secrets and private-key material
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+server_secret.bin
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs, temporary files, and backups
+*.log
+*.tmp
+*.temp
+*.bak
+*.backup
+*.swp
+*.swo
+~$*
+
+# IDE and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local security and test reports
+.secrets.baseline
+coverage.xml
+junit.xml
+reports/
+tools/backup/

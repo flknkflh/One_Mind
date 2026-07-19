@@ -2,4 +2,17 @@ __pycache__/
 *.pyc
 data/
 certs/
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+app/pki/root/
+app/pki/intermediate/
+app/pki/issued/
+app/pki/csr/
+app/pki/revoked/
 .git/

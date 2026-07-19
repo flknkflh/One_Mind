@@ -107,7 +107,7 @@ Data sensitif sementara—password, private key, AES key, plaintext, file import
 
 ## Secret dan Data Repository
 
-Repository saat ini melacak material yang tidak semestinya masuk source control:
+Riwayat repository memuat material yang tidak semestinya masuk source control:
 
 - root CA private key;
 - intermediate CA private key;
@@ -117,7 +117,7 @@ Repository saat ini melacak material yang tidak semestinya masuk source control:
 - envelope/ciphertext aktif;
 - backup wrapped key.
 
-Jika repository pernah disalin atau dikirim ke remote, anggap secret terekspos. Hapus dari source control dan sejarah Git dengan prosedur yang terkontrol, lalu rotasi/revokasi key dan token-signing secret. Menghapus file dari commit terbaru saja tidak membatalkan kebocoran historis.
+Material tersebut sudah dikeluarkan dari pelacakan branch produksi. Jika repository pernah disalin atau dikirim ke remote, tetap anggap secret terekspos. Bersihkan sejarah Git dengan prosedur yang terkontrol, lalu rotasi/revokasi key dan token-signing secret. Menghapus file dari commit terbaru saja tidak membatalkan kebocoran historis.
 
 ## Ancaman yang Tidak Ditangani Penuh
 
