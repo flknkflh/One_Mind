@@ -438,6 +438,13 @@
                 </select>
               </label>
               <p class="muted">Hanya metadata nama dan ukuran file yang tampil di katalog. Isi file tetap terenkripsi dan tidak dapat dibuka tanpa wrapped key.</p>
+              <div id="uploadProgress" class="downloadProgress hidden" role="status" aria-live="polite">
+                <div class="transferProgressHeader">
+                  <span class="loadingSpinner" aria-hidden="true"></span>
+                  <span id="uploadProgressText">Menyiapkan upload...</span>
+                </div>
+                <progress id="uploadProgressBar" max="100"></progress>
+              </div>
               <button type="submit">Enkripsi di browser dan upload</button>
             </form>
           </section>

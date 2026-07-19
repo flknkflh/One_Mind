@@ -504,6 +504,34 @@ button.danger:hover {
   accent-color: var(--accent);
 }
 
+.transferProgressHeader {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.loadingSpinner {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: loadingSpin 0.8s linear infinite;
+}
+
+@keyframes loadingSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loadingSpinner {
+    animation: none;
+  }
+}
+
 .list {
   display: grid;
   gap: 11px;

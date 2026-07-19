@@ -1356,6 +1356,12 @@ async function uploadCiphertext(
 }
 
 async function uploadChunks(session, chunks) {
+    const totalBytes = chunks.reduce(
+        (total, chunk) => total + chunk.bytes.length,
+        0
+    );
+    let uploadedBytes = 0;
+
     for (const chunk of chunks) {
         await api(
             "/api/upload/chunk",
@@ -1368,6 +1374,13 @@ async function uploadChunks(session, chunks) {
                     data_b64: bytesToB64(chunk.bytes)
                 })
             }
+        );
+
+        uploadedBytes += chunk.bytes.length;
+        const percent = Math.floor((uploadedBytes / totalBytes) * 100);
+        setUploadProgress(
+            `Mengirim chunk ${chunk.index + 1} dari ${chunk.total} - ${percent}%`,
+            percent
         );
 
     }
@@ -1400,6 +1413,25 @@ async function uploadFinish(
             })
         }
     );
+}
+
+function setUploadProgress(message, percent = null) {
+  const root = $("uploadProgress");
+  const bar = $("uploadProgressBar");
+  const text = $("uploadProgressText");
+  root?.classList.remove("hidden");
+  if (text) text.textContent = message;
+  if (bar) {
+    if (percent === null) {
+      bar.removeAttribute("value");
+    } else {
+      bar.value = Math.max(0, Math.min(100, percent));
+    }
+  }
+}
+
+function clearUploadProgress() {
+  $("uploadProgress")?.classList.add("hidden");
 }
 
 function setDownloadProgress(received, total, chunkIndex, totalChunks) {
@@ -2917,6 +2949,7 @@ on("uploadForm", "submit", async (evt) => {
     evt.preventDefault();
 
     const form = evt.currentTarget;
+    const submitButton = form.querySelector('button[type="submit"]');
 
     try {
 
@@ -2936,14 +2969,24 @@ on("uploadForm", "submit", async (evt) => {
             return;
         }
 
+        form.setAttribute("aria-busy", "true");
+        if (submitButton) submitButton.disabled = true;
+        setUploadProgress("Menyiapkan enkripsi file...");
+
         const me = await api("/api/me");
 
+        setUploadProgress("Mengenkripsi file di browser...");
+
         const encrypted = await encryptFile(file);
+
+        setUploadProgress("Membungkus kunci file untuk pemilik...");
 
         const wrapped = await wrapFileKey(
             encrypted.key,
             me.public_key
         );
+
+        setUploadProgress("Membuat sesi upload terenkripsi...");
 
         const upload = await uploadCiphertext(
             encrypted,
@@ -2955,6 +2998,8 @@ on("uploadForm", "submit", async (evt) => {
             upload.session,
             upload.chunks
         );
+
+        setUploadProgress("Memverifikasi dan menyimpan ciphertext...", 100);
 
         const result = await uploadFinish(
             upload.session,
@@ -2977,6 +3022,9 @@ on("uploadForm", "submit", async (evt) => {
     }
     finally {
 
+        clearUploadProgress();
+        form.removeAttribute("aria-busy");
+        if (submitButton) submitButton.disabled = false;
         form.reset();
 
     }
