@@ -522,7 +522,57 @@ button.danger:hover {
 }
 
 .userItem {
+  grid-template-columns: minmax(0, 1fr);
   background: linear-gradient(135deg, #10272d, #0c2026);
+}
+
+.userCatalog,
+.catalogFiles {
+  display: grid;
+  gap: 11px;
+}
+
+.userCatalogHead,
+.catalogFile {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.catalogFiles {
+  margin-top: 10px;
+  border-top: 1px solid var(--line);
+  padding-top: 11px;
+}
+
+.catalogFile {
+  border: 1px solid rgba(42, 73, 81, 0.72);
+  border-radius: var(--radius-sm);
+  padding: 11px 12px;
+  background: rgba(7, 22, 27, 0.62);
+}
+
+.catalogFile strong {
+  font-size: 13px;
+}
+
+.tabBadge {
+  display: inline-flex;
+  min-width: 22px;
+  min-height: 22px;
+  align-items: center;
+  justify-content: center;
+  margin-left: 7px;
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: #fff;
+  background: var(--danger);
+  font-size: 11px;
+}
+
+.requestPanel {
+  margin-top: 18px;
 }
 
 .adminAuthPanel {
@@ -896,6 +946,12 @@ code {
   .panelHead > button,
   .panelHead > div + button {
     width: 100%;
+  }
+
+  .userCatalogHead,
+  .catalogFile {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .keyActions button,

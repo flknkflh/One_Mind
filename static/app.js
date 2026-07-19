@@ -9,6 +9,8 @@ const state = {
   adminCertificateGroups: {},
   files: [],
   users: [],
+  fileCatalog: [],
+  fileRequests: {incoming: [], outgoing: []},
   pendingUpdateFileId: null,
   fileQuery: "",
   fileScope: "all",
@@ -1354,7 +1356,8 @@ async function uploadChunks(session, chunks) {
 async function uploadFinish(
     session,
     encrypted,
-    wrappedKey
+    wrappedKey,
+    isHidden
 ) {
 
     return await api(
@@ -1368,6 +1371,8 @@ async function uploadFinish(
                 envelope: encrypted.envelope,
 
                 wrapped_key_for_owner: wrappedKey,
+
+                is_hidden: isHidden,
 
                 ciphertext_sha256:
                     encrypted.ciphertext_sha256
@@ -1890,10 +1895,19 @@ async function refreshAdminDashboard() {
 
 async function refreshAll() {
   if (!state.token) return;
-  state.files = await api("/api/files");
-  state.users = await api("/api/users");
+  const [files, users, catalog, requests] = await Promise.all([
+    api("/api/files"),
+    api("/api/users"),
+    api("/api/file-catalog"),
+    api("/api/file-requests"),
+  ]);
+  state.files = files;
+  state.users = users;
+  state.fileCatalog = catalog;
+  state.fileRequests = requests;
   renderFiles();
   renderUsers();
+  renderFileRequests();
   renderSelects();
 }
 
@@ -2011,6 +2025,10 @@ function renderFiles() {
                 : "",
 
             canManage(file)
+                ? `<button class="ghost" data-visibility="${file.id}" data-hidden="${file.is_hidden ? "true" : "false"}">${file.is_hidden ? "Tampilkan di katalog" : "Hide dari katalog"}</button>`
+                : "",
+
+            canManage(file)
                 ? `<button class="danger" data-delete="${file.id}">Delete</button>`
                 : ""
 
@@ -2070,7 +2088,12 @@ function renderUsers() {
   const list = $("userList");
   if (!list) return;
   const query = normalized(state.userQuery);
-  const users = state.users.filter(user => normalized(`${user.display_name} ${user.username}`).includes(query));
+  const users = state.users.filter(user => {
+    const visibleFiles = state.fileCatalog.filter(file => file.owner === user.username);
+    return normalized(
+      `${user.display_name} ${user.username} ${visibleFiles.map(file => file.filename).join(" ")}`
+    ).includes(query);
+  });
   list.innerHTML = "";
   if (!state.users.length) {
     list.innerHTML = `<div class="emptyState"><strong>Belum ada user lain</strong><p>Buat akun lain dulu untuk mencoba sharing.</p></div>`;
@@ -2081,18 +2104,101 @@ function renderUsers() {
     return;
   }
   for (const user of users) {
+    const visibleFiles = state.fileCatalog.filter(file => file.owner === user.username);
+    const catalogHtml = visibleFiles.length
+      ? visibleFiles.map(file => {
+          let action;
+          if (file.has_access) {
+            action = `<button class="ghost" type="button" disabled>Sudah punya akses</button>`;
+          } else if (file.request_status === "PENDING") {
+            action = `<button class="ghost" type="button" disabled>Menunggu persetujuan</button>`;
+          } else {
+            const label = file.request_status === "REJECTED" || file.request_status === "CANCELLED"
+              ? "Minta lagi"
+              : "Minta file";
+            action = `<button type="button" data-request-file="${file.id}">${label}</button>`;
+          }
+          return `
+            <div class="catalogFile">
+              <div>
+                <strong>${escapeHtml(file.filename)}</strong>
+                <span class="meta">${Number(file.encrypted_size).toLocaleString()} byte · ${new Date(file.created_at).toLocaleString()}</span>
+              </div>
+              <div class="itemActions">${action}</div>
+            </div>
+          `;
+        }).join("")
+      : `<div class="muted">Tidak ada file yang ditampilkan oleh user ini.</div>`;
     const row = document.createElement("div");
     row.className = "item userItem";
     row.innerHTML = `
-      <div>
-        <strong>${escapeHtml(user.display_name)} (${escapeHtml(user.username)})</strong>
-        <span class="meta">Public key tersedia | siap menerima share terenkripsi</span>
-      </div>
-      <div class="itemActions">
-        <button class="ghost" data-copy-user="${escapeHtml(user.username)}">Pakai untuk share</button>
+      <div class="userCatalog">
+        <div class="userCatalogHead">
+          <div>
+            <strong>${escapeHtml(user.display_name)} (${escapeHtml(user.username)})</strong>
+            <span class="meta">Public key tersedia · ${visibleFiles.length} file ditampilkan</span>
+          </div>
+          <div class="itemActions">
+            <button class="ghost" type="button" data-copy-user="${escapeHtml(user.username)}">Pakai untuk share</button>
+          </div>
+        </div>
+        <div class="catalogFiles">${catalogHtml}</div>
       </div>
     `;
     list.appendChild(row);
+  }
+}
+
+function requestStatusLabel(status) {
+  return ({
+    PENDING: "Menunggu",
+    APPROVED: "Disetujui",
+    REJECTED: "Ditolak",
+    CANCELLED: "Dibatalkan karena file disembunyikan",
+  })[status] || status;
+}
+
+function renderFileRequests() {
+  const incomingList = $("incomingRequestList");
+  const outgoingList = $("outgoingRequestList");
+  const incoming = state.fileRequests?.incoming || [];
+  const outgoing = state.fileRequests?.outgoing || [];
+  const badge = $("requestBadge");
+
+  if (badge) {
+    badge.textContent = String(incoming.length);
+    badge.classList.toggle("hidden", incoming.length === 0);
+  }
+
+  if (incomingList) {
+    incomingList.innerHTML = incoming.length
+      ? incoming.map(request => `
+          <div class="item compact">
+            <div>
+              <strong>${escapeHtml(request.filename)}</strong>
+              <span class="meta">Diminta oleh ${escapeHtml(request.requester_display_name)} (${escapeHtml(request.requester)}) · ${new Date(request.requested_at).toLocaleString()}</span>
+            </div>
+            <div class="itemActions">
+              <button type="button" data-approve-request="${request.id}">Setujui & kirim kunci</button>
+              <button class="danger" type="button" data-reject-request="${request.id}">Tolak</button>
+            </div>
+          </div>
+        `).join("")
+      : `<div class="emptyState"><strong>Tidak ada permintaan masuk</strong><p>Permintaan baru akan muncul di sini.</p></div>`;
+  }
+
+  if (outgoingList) {
+    outgoingList.innerHTML = outgoing.length
+      ? outgoing.map(request => `
+          <div class="item compact">
+            <div>
+              <strong>${escapeHtml(request.filename)}</strong>
+              <span class="meta">Pemilik ${escapeHtml(request.owner_display_name)} (${escapeHtml(request.owner)}) · ${new Date(request.requested_at).toLocaleString()}</span>
+            </div>
+            <span class="statusBadge">${escapeHtml(requestStatusLabel(request.status))}</span>
+          </div>
+        `).join("")
+      : `<div class="emptyState"><strong>Belum ada permintaan keluar</strong><p>Pilih file dari Direktori User untuk meminta akses.</p></div>`;
   }
 }
 
@@ -2710,7 +2816,11 @@ on("uploadForm", "submit", async (evt) => {
 
         await ensureUnlockedPrivateKey();
 
-        const file = new FormData(form).get("file");
+        const formData = new FormData(form);
+
+        const file = formData.get("file");
+
+        const isHidden = formData.get("visibility") !== "visible";
 
         if (!file || !file.size) {
             return;
@@ -2739,7 +2849,8 @@ on("uploadForm", "submit", async (evt) => {
         const result = await uploadFinish(
             upload.session,
             encrypted,
-            wrapped
+            wrapped,
+            isHidden
         );
 
         showNotice("Upload selesai.");
@@ -2801,6 +2912,22 @@ on("fileList", "click", async (evt) => {
     await renderAccess(btn.dataset.access);
     return;
   }
+  if (btn.dataset.visibility) {
+    const isCurrentlyHidden = btn.dataset.hidden === "true";
+    const nextHidden = !isCurrentlyHidden;
+    const action = nextHidden ? "menyembunyikan" : "menampilkan";
+    if (!confirm(`Yakin ingin ${action} file ini dari katalog user?`)) return;
+    const result = await api(`/api/files/${btn.dataset.visibility}/visibility`, {
+      method: "PATCH",
+      body: JSON.stringify({is_hidden: nextHidden}),
+    });
+    await refreshAll();
+    const suffix = result.cancelled_requests
+      ? ` ${result.cancelled_requests} permintaan yang masih menunggu dibatalkan.`
+      : "";
+    showNotice(`Visibilitas file diperbarui.${suffix}`);
+    return;
+  }
   if (!btn.dataset.download) return;
   const {file, fileKey} = await getFileKey(btn.dataset.download);
   const blob = await decryptEnvelope(file.envelope, fileKey);
@@ -2825,14 +2952,62 @@ on("userSearch", "input", (evt) => {
   state.userQuery = evt.currentTarget.value;
   renderUsers();
 });
-on("userList", "click", (evt) => {
-  const btn = evt.target.closest("[data-copy-user]");
-  if (!btn) return;
+on("userList", "click", async (evt) => {
+  const requestButton = evt.target.closest("[data-request-file]");
+  if (requestButton) {
+    try {
+      await api(`/api/files/${requestButton.dataset.requestFile}/requests`, {
+        method: "POST",
+      });
+      await refreshAll();
+      showNotice("Permintaan file dikirim kepada pemilik.");
+    } catch (err) {
+      alert(err.message || err);
+    }
+    return;
+  }
+
+  const shareButton = evt.target.closest("[data-copy-user]");
+  if (!shareButton) return;
   const shareTab = document.querySelector('.tabs button[data-tab="share"]');
   shareTab?.click();
   const userSelect = document.querySelector("#shareForm select[name=recipient]");
-  if (userSelect) userSelect.value = btn.dataset.copyUser;
-  showNotice(`User ${btn.dataset.copyUser} dipilih sebagai penerima share.`);
+  if (userSelect) userSelect.value = shareButton.dataset.copyUser;
+  showNotice(`User ${shareButton.dataset.copyUser} dipilih sebagai penerima share.`);
+});
+on("refreshRequestsBtn", "click", refreshAll);
+on("incomingRequestList", "click", async (evt) => {
+  const approveButton = evt.target.closest("[data-approve-request]");
+  const rejectButton = evt.target.closest("[data-reject-request]");
+  if (!approveButton && !rejectButton) return;
+
+  try {
+    if (approveButton) {
+      const requestId = approveButton.dataset.approveRequest;
+      const request = (state.fileRequests?.incoming || []).find(item => item.id === requestId);
+      if (!request) throw new Error("Permintaan tidak ditemukan. Muat ulang halaman.");
+
+      const {fileKey} = await getFileKey(request.file_id);
+      const requester = await api(`/api/users/${encodeURIComponent(request.requester)}/public-key`);
+      const wrappedKey = await wrapFileKey(fileKey, requester.public_key);
+      await api(`/api/file-requests/${requestId}/approve`, {
+        method: "POST",
+        body: JSON.stringify({wrapped_key: wrappedKey}),
+      });
+      await refreshAll();
+      showNotice("Permintaan disetujui. Wrapped key dikirim dan akses viewer aktif.");
+      return;
+    }
+
+    if (!confirm("Tolak permintaan file ini?")) return;
+    await api(`/api/file-requests/${rejectButton.dataset.rejectRequest}/reject`, {
+      method: "POST",
+    });
+    await refreshAll();
+    showNotice("Permintaan file ditolak.");
+  } catch (err) {
+    alert(err.message || err);
+  }
 });
 on("loadAccessBtn", "click", async () => {
   const fileId = document.querySelector("#shareForm select[name=file_id]")?.value;
@@ -2978,6 +3153,12 @@ renderAuth();
 refreshAll();
 refreshAdminSetupStatus();
 refreshAdminDashboard();
+
+// Sinkronkan badge permintaan dan akses yang baru disetujui tanpa menyimpan key.
+setInterval(() => {
+  if (!state.token) return;
+  refreshAll().catch(err => console.warn("Gagal menyegarkan permintaan file:", err));
+}, 30000);
 
 on("dippFile", "change", (evt) => {
 

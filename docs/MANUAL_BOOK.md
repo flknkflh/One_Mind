@@ -70,6 +70,7 @@ Tabel utama:
 - `certificate_challenges`: nonce login terbaru per pengguna;
 - `files`: owner, nama file, nama envelope, ukuran terenkripsi, waktu;
 - `shares`: penerima, permission, dan wrapped key;
+- `file_requests`: permintaan akses, pemilik, peminta, status, dan timestamp;
 - `upload_sessions`: metadata dan progres upload chunk;
 - tabel certificate request/revocation untuk state PKI terkait.
 
@@ -179,7 +180,7 @@ Refresh atau menutup tab menghilangkan private key dari RAM, tetapi token persis
 
 ## 9. Upload File
 
-1. Pilih file.
+1. Pilih file dan tentukan visibilitas katalog. Default `Hide` menjaga file tidak terlihat oleh akun tanpa akses.
 2. Browser menentukan ukuran chunk:
    - hingga 10 MB: maksimal 10 MB;
    - hingga 100 MB: 1 MB;
@@ -216,6 +217,20 @@ Owner memilih penerima serta `viewer` atau `editor`. Browser mengambil DIPP publ
 - `owner`: seluruh operasi editor ditambah share, revoke, dan delete.
 
 Server tidak menerima raw AES key pada alur normal.
+
+### Permintaan file dari Direktori User
+
+File yang tidak di-hide muncul sebagai metadata pada akun pemilik di tab Direktori User. User lain dapat menekan **Minta file**. Owner menerima notifikasi pada tab Permintaan File.
+
+Saat owner menekan **Setujui & kirim kunci**:
+
+1. browser owner membuka wrapped key owner menggunakan DIPP private key di RAM;
+2. browser mengambil DIPP public key peminta;
+3. browser membungkus AES key untuk peminta;
+4. backend menyimpan wrapped key dan akses `viewer`;
+5. file muncul pada daftar file peminta.
+
+Owner dapat mengubah file menjadi hide atau tampil setelah upload. Mengubah menjadi hide membatalkan permintaan yang masih `PENDING`, tetapi tidak mencabut share yang sudah disetujui.
 
 ## 12. Revoke dan Rotasi
 
@@ -298,10 +313,16 @@ Semua endpoint file/user/certificate memerlukan `Authorization: Bearer <token>`,
 | GET | `/api/files/{file_id}` | Envelope dan wrapped key akun |
 | GET | `/api/files/{file_id}/access` | Daftar penerima/permission/public key |
 | PATCH | `/api/files/{file_id}` | Rename oleh owner/editor |
+| PATCH | `/api/files/{file_id}/visibility` | Hide/tampilkan file oleh owner |
 | PUT | `/api/files/{file_id}` | Update envelope dan rotasi wrapped key |
 | DELETE | `/api/files/{file_id}` | Delete oleh owner |
 | POST | `/api/share` | Share oleh owner |
 | DELETE | `/api/files/{file_id}/shares/{recipient}` | Revoke oleh owner |
+| GET | `/api/file-catalog` | Metadata file yang ditampilkan owner |
+| POST | `/api/files/{file_id}/requests` | Minta akses file katalog |
+| GET | `/api/file-requests` | Permintaan masuk dan keluar |
+| POST | `/api/file-requests/{request_id}/approve` | Setujui dengan wrapped key peminta |
+| POST | `/api/file-requests/{request_id}/reject` | Tolak permintaan |
 
 ### Administrator
 

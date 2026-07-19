@@ -1,0 +1,163 @@
+import json
+import unittest
+
+from fastapi import HTTPException
+
+from app import main
+
+
+class FileRequestTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = main.db()
+        self._clear_data()
+        for username in ("alice", "bob", "charlie"):
+            self.conn.execute(
+                """
+                INSERT INTO users (
+                    username, display_name, password_hash, nip, rank, position,
+                    public_key, pki_public_key, account_status,
+                    certificate_status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 'NONE', ?)
+                """,
+                (
+                    username,
+                    username.title(),
+                    main.hash_password("password-test-yang-kuat"),
+                    f"NIP-{username}",
+                    "TEST",
+                    "TEST",
+                    json.dumps({"algorithm": "DIPP-TEST", "username": username}),
+                    "PUBLIC-KEY-PLACEHOLDER",
+                    main.now_iso(),
+                ),
+            )
+        self.conn.commit()
+
+    def tearDown(self):
+        self._clear_data()
+        self.conn.close()
+
+    def _clear_data(self):
+        self.conn.execute("DELETE FROM file_requests")
+        self.conn.execute("DELETE FROM shares")
+        self.conn.execute("DELETE FROM files")
+        self.conn.execute("DELETE FROM upload_sessions")
+        self.conn.execute("DELETE FROM certificate_requests")
+        self.conn.execute("DELETE FROM certificate_challenges")
+        self.conn.execute("DELETE FROM certificate_revocation")
+        self.conn.execute("DELETE FROM certificates")
+        self.conn.execute("DELETE FROM users")
+        self.conn.commit()
+
+    def insert_file(self, file_id: str, *, hidden: bool):
+        self.conn.execute(
+            """
+            INSERT INTO files (
+                id, owner, filename, envelope_name,
+                encrypted_size, is_hidden, created_at
+            ) VALUES (?, 'alice', ?, ?, 2048, ?, ?)
+            """,
+            (
+                file_id,
+                f"{file_id}.txt",
+                f"{file_id}.json",
+                int(hidden),
+                main.now_iso(),
+            ),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO shares (
+                id, file_id, owner, recipient,
+                wrapped_key, permission, created_at
+            ) VALUES (?, ?, 'alice', 'alice', ?, 'owner', ?)
+            """,
+            (
+                f"share-{file_id}",
+                file_id,
+                json.dumps({"wrapped": "owner-key"}),
+                main.now_iso(),
+            ),
+        )
+        self.conn.commit()
+
+    def test_catalog_exposes_only_visible_metadata(self):
+        self.insert_file("visible-file", hidden=False)
+        self.insert_file("hidden-file", hidden=True)
+
+        catalog = main.file_catalog(username="bob")
+
+        self.assertEqual([item["id"] for item in catalog], ["visible-file"])
+        self.assertNotIn("envelope", catalog[0])
+        self.assertNotIn("wrapped_key", catalog[0])
+        self.assertFalse(catalog[0]["has_access"])
+
+    def test_request_requires_visible_file_and_cannot_duplicate(self):
+        self.insert_file("visible-file", hidden=False)
+        self.insert_file("hidden-file", hidden=True)
+
+        created = main.create_file_request("visible-file", username="bob")
+        self.assertEqual(created["status"], "PENDING")
+
+        with self.assertRaises(HTTPException) as duplicate:
+            main.create_file_request("visible-file", username="bob")
+        self.assertEqual(duplicate.exception.status_code, 409)
+
+        with self.assertRaises(HTTPException) as hidden:
+            main.create_file_request("hidden-file", username="bob")
+        self.assertEqual(hidden.exception.status_code, 404)
+
+    def test_only_owner_can_approve_and_share_is_viewer(self):
+        self.insert_file("visible-file", hidden=False)
+        request_id = main.create_file_request(
+            "visible-file",
+            username="bob",
+        )["id"]
+        approval = main.FileRequestApprovalIn(
+            wrapped_key={"wrapped": "key-for-bob"},
+        )
+
+        with self.assertRaises(HTTPException) as unauthorized:
+            main.approve_file_request(request_id, approval, username="charlie")
+        self.assertEqual(unauthorized.exception.status_code, 403)
+
+        result = main.approve_file_request(request_id, approval, username="alice")
+        self.assertEqual(result["status"], "APPROVED")
+
+        share = self.conn.execute(
+            "SELECT permission, wrapped_key FROM shares WHERE file_id=? AND recipient='bob'",
+            ("visible-file",),
+        ).fetchone()
+        request_row = self.conn.execute(
+            "SELECT status FROM file_requests WHERE id=?",
+            (request_id,),
+        ).fetchone()
+        self.assertEqual(share["permission"], "viewer")
+        self.assertEqual(json.loads(share["wrapped_key"])["wrapped"], "key-for-bob")
+        self.assertEqual(request_row["status"], "APPROVED")
+
+    def test_hiding_file_cancels_pending_requests(self):
+        self.insert_file("visible-file", hidden=False)
+        request_id = main.create_file_request(
+            "visible-file",
+            username="bob",
+        )["id"]
+
+        result = main.update_file_visibility(
+            "visible-file",
+            main.FileVisibilityIn(is_hidden=True),
+            username="alice",
+        )
+
+        request_row = self.conn.execute(
+            "SELECT status FROM file_requests WHERE id=?",
+            (request_id,),
+        ).fetchone()
+        self.assertTrue(result["is_hidden"])
+        self.assertEqual(result["cancelled_requests"], 1)
+        self.assertEqual(request_row["status"], "CANCELLED")
+        self.assertEqual(main.file_catalog(username="bob"), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

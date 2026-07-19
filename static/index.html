@@ -344,6 +344,10 @@
               Direktori User
             </button>
 
+            <button data-tab="requests">
+              Permintaan File <span id="requestBadge" class="tabBadge hidden">0</span>
+            </button>
+
             <button data-tab="identity">
               Identitas DIPP
             </button>
@@ -423,6 +427,13 @@
               <label class="fileDrop">Pilih file
                 <input name="file" type="file" required>
               </label>
+              <label>Visibilitas katalog
+                <select name="visibility" required>
+                  <option value="hidden" selected>Hide — hanya terlihat oleh penerima akses</option>
+                  <option value="visible">Tampilkan nama file di Direktori User</option>
+                </select>
+              </label>
+              <p class="muted">Hanya metadata nama dan ukuran file yang tampil di katalog. Isi file tetap terenkripsi dan tidak dapat dibuka tanpa wrapped key.</p>
               <button type="submit">Enkripsi di browser dan upload</button>
             </form>
           </section>
@@ -459,7 +470,7 @@
               <div class="panelHead">
                 <div>
                   <h2>Direktori user</h2>
-                  <p>Akun lain yang bisa menerima share. File mereka tetap tidak terlihat kecuali mereka memberi akses.</p>
+                  <p>Lihat file yang sengaja ditampilkan oleh pemilik dan kirim permintaan akses. Isi file tetap terenkripsi sampai pemilik menyetujui.</p>
                 </div>
               </div>
               <div class="toolbar">
@@ -468,6 +479,25 @@
                 </label>
               </div>
               <div id="userList" class="list"></div>
+            </div>
+          </section>
+
+          <section id="requestsTab" class="tab hidden">
+            <div class="panel">
+              <div class="panelHead">
+                <div>
+                  <h2>Permintaan masuk</h2>
+                  <p>Saat disetujui, browser Anda membuka file key milik sendiri lalu membungkusnya untuk public key peminta.</p>
+                </div>
+                <button id="refreshRequestsBtn" class="ghost" type="button">Muat ulang</button>
+              </div>
+              <div id="incomingRequestList" class="list"></div>
+            </div>
+
+            <div class="panel requestPanel">
+              <h2>Permintaan saya</h2>
+              <p>Status file yang pernah Anda minta dari user lain.</p>
+              <div id="outgoingRequestList" class="list"></div>
             </div>
           </section>
 

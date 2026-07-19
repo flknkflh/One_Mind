@@ -99,6 +99,8 @@ DIPP-KEM pada repository adalah algoritma custom/prototipe berbasis implementasi
 
 Server memeriksa bearer token dan record `shares`. Pencabutan akses menghentikan request berikutnya, tetapi tidak dapat menarik plaintext atau key lama yang sudah disalin pengguna. Rotasi key melindungi versi berikutnya; ia tidak menghapus salinan historis.
 
+File katalog hanya memaparkan metadata file yang dipilih owner sebagai tidak tersembunyi. Katalog tidak mengirim envelope, ciphertext, atau wrapped key. Permintaan akses tidak memberi hak baca sampai owner menyetujui dan browser owner membuat wrapped key untuk public key peminta. Persetujuan dari alur permintaan selalu menghasilkan permission `viewer`.
+
 ## Penyimpanan Browser
 
 `localStorage` memuat token dan username user/admin. Tidak ada cookie `HttpOnly`, `sessionStorage`, atau IndexedDB pada implementasi saat ini. Konsekuensinya, XSS atau JavaScript origin yang berbahaya dapat membaca token.

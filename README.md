@@ -85,11 +85,15 @@ Browser:
 
 Server memverifikasi hash ciphertext gabungan lalu menyimpan envelope ciphertext dan metadata file.
 
+Saat upload, owner memilih file disembunyikan atau ditampilkan pada katalog internal. File lama dan pilihan default tetap tersembunyi. Katalog hanya menampilkan metadata; ciphertext dan key tidak diberikan kepada user yang belum mempunyai akses.
+
 ### 5. Download dan berbagi
 
 Server hanya mengembalikan file kepada akun yang memiliki record akses. Browser membuka wrapped key memakai DIPP private key di RAM, lalu mendekripsi ciphertext.
 
 Owner dapat membagikan file sebagai `viewer` atau `editor`. Owner membuka AES key secara lokal dan membungkusnya kembali untuk DIPP public key penerima. Owner dapat mencabut akses; rotasi key diperlukan untuk melindungi versi file berikutnya dari key lama yang mungkin sudah diperoleh penerima.
+
+Untuk file yang ditampilkan pada katalog, user lain dapat mengirim permintaan. Saat owner menyetujui, browser owner membuka wrapped key miliknya dan membuat wrapped key baru untuk public key peminta. Server kemudian memberikan akses `viewer`; raw AES key tetap tidak dikirim ke server.
 
 ### 6. Update dan rotasi key
 

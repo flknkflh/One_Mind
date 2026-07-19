@@ -405,6 +405,7 @@ def db() -> sqlite3.Connection:
             filename TEXT NOT NULL,
             envelope_name TEXT NOT NULL,
             encrypted_size INTEGER NOT NULL,
+            is_hidden INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             FOREIGN KEY(owner) REFERENCES users(username)
         );
@@ -421,6 +422,26 @@ def db() -> sqlite3.Connection:
             FOREIGN KEY(owner) REFERENCES users(username),
             FOREIGN KEY(recipient) REFERENCES users(username)
         );
+
+        CREATE TABLE IF NOT EXISTS file_requests (
+            id TEXT PRIMARY KEY,
+            file_id TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            requester TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            requested_at TEXT NOT NULL,
+            resolved_at TEXT,
+            FOREIGN KEY(file_id) REFERENCES files(id),
+            FOREIGN KEY(owner) REFERENCES users(username),
+            FOREIGN KEY(requester) REFERENCES users(username)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_file_requests_pending
+        ON file_requests(file_id, requester)
+        WHERE status='PENDING';
+
+        CREATE INDEX IF NOT EXISTS idx_file_requests_owner_status
+        ON file_requests(owner, status, requested_at);
 
         CREATE TABLE IF NOT EXISTS certificate_requests (
             id TEXT PRIMARY KEY,
@@ -514,6 +535,19 @@ def db() -> sqlite3.Connection:
         )
         conn.execute(
             "UPDATE shares SET permission='owner' WHERE recipient=owner"
+        )
+
+    # File lama tetap privat sampai pemilik memilih menampilkannya di katalog.
+    file_columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(files)"
+        ).fetchall()
+    }
+
+    if "is_hidden" not in file_columns:
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN is_hidden INTEGER NOT NULL DEFAULT 1"
         )
 
     # ==========================================================
@@ -898,6 +932,7 @@ class UploadFinishIn(BaseModel):
     envelope: dict
     wrapped_key_for_owner: dict
     ciphertext_sha256: str
+    is_hidden: bool = True
 
 class WrappedKeyIn(BaseModel):
     recipient: str
@@ -912,6 +947,14 @@ class FileUpdateIn(BaseModel):
 
 class FileRenameIn(BaseModel):
     filename: str = Field(min_length=1, max_length=240)
+
+
+class FileVisibilityIn(BaseModel):
+    is_hidden: bool
+
+
+class FileRequestApprovalIn(BaseModel):
+    wrapped_key: dict
 
 
 app = FastAPI(title="ONE_MIND", version="2.0")
@@ -2070,6 +2113,237 @@ def user_public_key(target_username: str, username: str = Depends(current_user))
     return {"username": row["username"], "display_name": row["display_name"], "public_key": json.loads(row["public_key"])}
 
 
+@app.get("/api/file-catalog")
+def file_catalog(username: str = Depends(current_user)):
+    """Metadata file publik internal; tidak pernah mengirim envelope atau key."""
+
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT
+            f.id,
+            f.owner,
+            u.display_name AS owner_display_name,
+            f.filename,
+            f.encrypted_size,
+            f.created_at,
+            EXISTS(
+                SELECT 1
+                FROM shares s
+                WHERE s.file_id=f.id AND s.recipient=?
+            ) AS has_access,
+            (
+                SELECT fr.status
+                FROM file_requests fr
+                WHERE fr.file_id=f.id AND fr.requester=?
+                ORDER BY fr.requested_at DESC, fr.rowid DESC
+                LIMIT 1
+            ) AS request_status
+        FROM files f
+        JOIN users u ON u.username=f.owner
+        WHERE f.is_hidden=0
+          AND f.owner<>?
+          AND u.account_status='ACTIVE'
+        ORDER BY u.display_name, f.created_at DESC
+        """,
+        (username, username, username),
+    ).fetchall()
+    conn.close()
+    return [
+        dict(row) | {
+            "has_access": bool(row["has_access"]),
+        }
+        for row in rows
+    ]
+
+
+@app.get("/api/file-requests")
+def list_file_requests(username: str = Depends(current_user)):
+    conn = db()
+    incoming = conn.execute(
+        """
+        SELECT
+            fr.id,
+            fr.file_id,
+            fr.requester,
+            u.display_name AS requester_display_name,
+            f.filename,
+            fr.status,
+            fr.requested_at
+        FROM file_requests fr
+        JOIN files f ON f.id=fr.file_id
+        JOIN users u ON u.username=fr.requester
+        WHERE fr.owner=? AND fr.status='PENDING'
+        ORDER BY fr.requested_at DESC
+        """,
+        (username,),
+    ).fetchall()
+    outgoing = conn.execute(
+        """
+        SELECT
+            fr.id,
+            fr.file_id,
+            fr.owner,
+            u.display_name AS owner_display_name,
+            f.filename,
+            fr.status,
+            fr.requested_at,
+            fr.resolved_at
+        FROM file_requests fr
+        JOIN files f ON f.id=fr.file_id
+        JOIN users u ON u.username=fr.owner
+        WHERE fr.requester=?
+        ORDER BY fr.requested_at DESC
+        LIMIT 100
+        """,
+        (username,),
+    ).fetchall()
+    conn.close()
+    return {
+        "incoming": [dict(row) for row in incoming],
+        "outgoing": [dict(row) for row in outgoing],
+    }
+
+
+@app.post("/api/files/{file_id}/requests")
+def create_file_request(file_id: str, username: str = Depends(current_user)):
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    file_row = conn.execute(
+        "SELECT id, owner, is_hidden FROM files WHERE id=?",
+        (file_id,),
+    ).fetchone()
+
+    if not file_row or file_row["is_hidden"]:
+        conn.close()
+        raise HTTPException(status_code=404, detail="File tidak tersedia di katalog.")
+    if file_row["owner"] == username:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Pemilik tidak perlu meminta file sendiri.")
+    if conn.execute(
+        "SELECT 1 FROM shares WHERE file_id=? AND recipient=?",
+        (file_id, username),
+    ).fetchone():
+        conn.close()
+        raise HTTPException(status_code=409, detail="Anda sudah memiliki akses file.")
+    if conn.execute(
+        "SELECT 1 FROM file_requests WHERE file_id=? AND requester=? AND status='PENDING'",
+        (file_id, username),
+    ).fetchone():
+        conn.close()
+        raise HTTPException(status_code=409, detail="Permintaan file masih menunggu persetujuan.")
+
+    request_id = new_id()
+    try:
+        conn.execute(
+            """
+            INSERT INTO file_requests (
+                id, file_id, owner, requester, status, requested_at
+            ) VALUES (?, ?, ?, ?, 'PENDING', ?)
+            """,
+            (request_id, file_id, file_row["owner"], username, now_iso()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Permintaan file masih menunggu persetujuan.",
+        ) from exc
+    finally:
+        conn.close()
+
+    return {"id": request_id, "status": "PENDING"}
+
+
+@app.post("/api/file-requests/{request_id}/approve")
+def approve_file_request(
+    request_id: str,
+    data: FileRequestApprovalIn,
+    username: str = Depends(current_user),
+):
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    request_row = conn.execute(
+        """
+        SELECT fr.id, fr.file_id, fr.owner, fr.requester, fr.status,
+               u.account_status AS requester_status
+        FROM file_requests fr
+        JOIN users u ON u.username=fr.requester
+        WHERE fr.id=?
+        """,
+        (request_id,),
+    ).fetchone()
+
+    if not request_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Permintaan file tidak ditemukan.")
+    if request_row["owner"] != username:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Hanya pemilik file yang dapat menyetujui.")
+    if request_row["status"] != "PENDING":
+        conn.close()
+        raise HTTPException(status_code=409, detail="Permintaan file sudah diproses.")
+    if request_row["requester_status"] != "ACTIVE":
+        conn.close()
+        raise HTTPException(status_code=409, detail="Akun peminta tidak aktif.")
+
+    existing_share = conn.execute(
+        "SELECT 1 FROM shares WHERE file_id=? AND recipient=?",
+        (request_row["file_id"], request_row["requester"]),
+    ).fetchone()
+    if not existing_share:
+        conn.execute(
+            """
+            INSERT INTO shares (
+                id, file_id, owner, recipient, wrapped_key, permission, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'viewer', ?)
+            """,
+            (
+                new_id(),
+                request_row["file_id"],
+                username,
+                request_row["requester"],
+                json.dumps(data.wrapped_key),
+                now_iso(),
+            ),
+        )
+    conn.execute(
+        "UPDATE file_requests SET status='APPROVED', resolved_at=? WHERE id=?",
+        (now_iso(), request_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "status": "APPROVED"}
+
+
+@app.post("/api/file-requests/{request_id}/reject")
+def reject_file_request(request_id: str, username: str = Depends(current_user)):
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    request_row = conn.execute(
+        "SELECT owner, status FROM file_requests WHERE id=?",
+        (request_id,),
+    ).fetchone()
+    if not request_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Permintaan file tidak ditemukan.")
+    if request_row["owner"] != username:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Hanya pemilik file yang dapat menolak.")
+    if request_row["status"] != "PENDING":
+        conn.close()
+        raise HTTPException(status_code=409, detail="Permintaan file sudah diproses.")
+
+    conn.execute(
+        "UPDATE file_requests SET status='REJECTED', resolved_at=? WHERE id=?",
+        (now_iso(), request_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "status": "REJECTED"}
+
+
 @app.post("/api/upload/start")
 def upload_start(
     data: UploadStartIn,
@@ -2345,10 +2619,11 @@ def upload_finish(
                 filename,
                 envelope_name,
                 encrypted_size,
+                is_hidden,
                 created_at
             )
             VALUES
-            (?, ?, ?, ?, ?, ?)
+            (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 file_id,
@@ -2356,6 +2631,7 @@ def upload_finish(
                 row["filename"],
                 envelope_name,
                 len(envelope_bytes),
+                int(data.is_hidden),
                 now_iso()
             )
         )
@@ -2435,6 +2711,7 @@ def list_files(username: str =Depends(current_user)):
             f.owner,
             f.filename,
             f.encrypted_size,
+            f.is_hidden,
             f.created_at,
             f.envelope_name,
             s.permission
@@ -2552,6 +2829,39 @@ def rename_file(file_id: str, data: FileRenameIn, username: str = Depends(curren
     return {"ok": True}
 
 
+@app.patch("/api/files/{file_id}/visibility")
+def update_file_visibility(
+    file_id: str,
+    data: FileVisibilityIn,
+    username: str = Depends(current_user),
+):
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    require_file_permission(conn, file_id, username, {"owner"})
+    conn.execute(
+        "UPDATE files SET is_hidden=? WHERE id=?",
+        (int(data.is_hidden), file_id),
+    )
+    cancelled = 0
+    if data.is_hidden:
+        cursor = conn.execute(
+            """
+            UPDATE file_requests
+            SET status='CANCELLED', resolved_at=?
+            WHERE file_id=? AND status='PENDING'
+            """,
+            (now_iso(), file_id),
+        )
+        cancelled = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return {
+        "ok": True,
+        "is_hidden": data.is_hidden,
+        "cancelled_requests": cancelled,
+    }
+
+
 @app.put("/api/files/{file_id}")
 def update_file(file_id: str, data: FileUpdateIn, username: str = Depends(current_user)):
     conn = db()
@@ -2640,6 +2950,7 @@ def delete_file(file_id: str, username: str = Depends(current_user)):
     conn = db()
     require_file_permission(conn, file_id, username, {"owner"})
     row = conn.execute("SELECT envelope_name FROM files WHERE id=?", (file_id,)).fetchone()
+    conn.execute("DELETE FROM file_requests WHERE file_id=?", (file_id,))
     conn.execute("DELETE FROM shares WHERE file_id=?", (file_id,))
     conn.execute("DELETE FROM files WHERE id=?", (file_id,))
     conn.commit()
@@ -2666,6 +2977,14 @@ def share_file(data: ShareIn, username: str = Depends(current_user)):
     conn.execute(
         "INSERT INTO shares (id, file_id, owner, recipient, wrapped_key, permission, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (new_id(), data.file_id, owner, data.recipient, json.dumps(data.wrapped_key), data.permission, now_iso()),
+    )
+    conn.execute(
+        """
+        UPDATE file_requests
+        SET status='APPROVED', resolved_at=?
+        WHERE file_id=? AND requester=? AND status='PENDING'
+        """,
+        (now_iso(), data.file_id, data.recipient),
     )
     conn.commit()
     conn.close()
