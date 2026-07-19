@@ -7,7 +7,22 @@ Dokumentasi:
 - [Manual sistem](docs/MANUAL_BOOK.md)
 - [Catatan keamanan](docs/SECURITY.md)
 - [Panduan TLS dan deployment](docs/TLS_MIGRATION.md)
+- [Audit riwayat remote](docs/REMOTE_HISTORY_AUDIT.md)
 - [Konteks implementasi](Prompt.md)
+
+## Menjalankan Test
+
+Test autentikasi dan PKI berada pada Docker build stage terpisah sehingga tidak
+ikut masuk image produksi:
+
+```bash
+docker build --target test -t one-mind-tests .
+docker run --rm -e ONE_MIND_DATA_DIR=/tmp/one-mind-tests one-mind-tests
+```
+
+Suite ini memverifikasi baseline password, integritas token, RSA
+proof-of-possession, validasi issuer/signature certificate, deteksi rotasi CA,
+dan penerbitan ulang certificate setelah RSA proof yang valid.
 
 > Status dokumentasi: diselaraskan dengan kode repository pada 18 Juli 2026. Implementasi saat ini berbeda dari rancangan lama yang menyimpan private key terenkripsi di `localStorage`.
 

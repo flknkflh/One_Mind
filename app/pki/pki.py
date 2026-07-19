@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography import x509
 from cryptography.x509.oid import NameOID
@@ -172,13 +172,13 @@ def generate_root_ca():
 
         .not_valid_before(
 
-            datetime.utcnow()
+            datetime.now(timezone.utc)
 
         )
 
         .not_valid_after(
 
-            datetime.utcnow()
+            datetime.now(timezone.utc)
 
             + timedelta(days=3650)
 
@@ -333,11 +333,11 @@ def generate_intermediate_ca():
         )
 
         .not_valid_before(
-            datetime.utcnow()
+            datetime.now(timezone.utc)
         )
 
         .not_valid_after(
-            datetime.utcnow()
+            datetime.now(timezone.utc)
             + timedelta(days=1825)
         )
 
@@ -429,7 +429,34 @@ def initialize_pki(auto_init: bool = True):
     generate_root_ca()
     generate_intermediate_ca()
 
-from cryptography.hazmat.primitives.asymmetric import padding
+
+def intermediate_ca_fingerprint() -> str:
+    certificate = load_certificate(INTERMEDIATE_CERT)
+    return certificate.fingerprint(hashes.SHA256()).hex()
+
+
+def certificate_matches_current_intermediate(certificate_pem: str) -> bool:
+    """Validasi issuer dan signature certificate terhadap Intermediate CA aktif."""
+
+    try:
+        certificate = x509.load_pem_x509_certificate(
+            certificate_pem.encode("utf-8")
+        )
+        intermediate = load_certificate(INTERMEDIATE_CERT)
+
+        if certificate.issuer != intermediate.subject:
+            return False
+
+        verify_certificate_signature(intermediate, certificate)
+        return True
+    except Exception:
+        return False
+
+
+def remove_user_certificate(username: str) -> None:
+    path = ISSUED_DIR / f"{username}.crt"
+    if path.exists():
+        path.unlink()
 
 
 def verify_certificate_signature(
@@ -703,13 +730,13 @@ def issue_certificate(
 
         .not_valid_before(
 
-            datetime.utcnow()
+            datetime.now(timezone.utc)
 
         )
 
         .not_valid_after(
 
-            datetime.utcnow()
+            datetime.now(timezone.utc)
 
             + timedelta(days=365)
 

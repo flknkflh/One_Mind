@@ -20,7 +20,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app.pki.pki import initialize_pki, issue_certificate
+from app.pki.pki import (
+    certificate_matches_current_intermediate,
+    initialize_pki,
+    intermediate_ca_fingerprint,
+    issue_certificate,
+    remove_user_certificate,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -178,7 +184,12 @@ def verify_password(password: str, encoded: str) -> bool:
 
 def sign_token(username: str) -> str:
     nonce = new_id(24)
-    payload = {"username": username, "nonce": nonce, "exp": int(time.time()) + SESSION_SECONDS}
+    payload = {
+        "type": "user",
+        "username": username,
+        "nonce": nonce,
+        "exp": int(time.time()) + SESSION_SECONDS,
+    }
     raw = b64e(json.dumps(payload, sort_keys=True).encode("utf-8"))
     sig = hmac.new(get_secret(), raw.encode("ascii"), hashlib.sha256).hexdigest()
     return f"{raw}.{sig}"
@@ -228,6 +239,8 @@ def verify_token(token: str) -> str:
         if not hmac.compare_digest(sig, expected):
             raise ValueError
         payload = json.loads(b64d(raw).decode("utf-8"))
+        if payload.get("type") != "user":
+            raise ValueError
         if int(payload.get("exp", 0)) < int(time.time()):
             raise HTTPException(status_code=401, detail="Sesi sudah kedaluwarsa. Silakan login ulang.")
         return payload["username"]
@@ -316,10 +329,7 @@ def verify_pki_signature(
 
         return True
 
-    except Exception as e:
-
-        print("VERIFY ERROR:", repr(e))
-
+    except Exception:
         return False
 
 
@@ -475,6 +485,12 @@ def db() -> sqlite3.Connection:
             detail TEXT,
             created_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS system_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """
     )
 
@@ -597,6 +613,62 @@ def db() -> sqlite3.Connection:
     conn.commit()
 
     return conn
+
+
+def reconcile_certificates_after_ca_rotation(conn: sqlite3.Connection) -> int:
+    """Ganti status certificate yang tidak diterbitkan Intermediate CA aktif."""
+
+    fingerprint = intermediate_ca_fingerprint()
+    active_certificates = conn.execute(
+        """
+        SELECT serial_number, username, certificate_pem
+        FROM certificates
+        WHERE status='ACTIVE'
+        """
+    ).fetchall()
+
+    affected_users: set[str] = set()
+
+    for certificate in active_certificates:
+        if certificate_matches_current_intermediate(certificate["certificate_pem"]):
+            continue
+
+        conn.execute(
+            "UPDATE certificates SET status='REPLACED' WHERE serial_number=?",
+            (certificate["serial_number"],),
+        )
+        affected_users.add(certificate["username"])
+
+    for username in affected_users:
+        remaining = conn.execute(
+            """
+            SELECT 1
+            FROM certificates
+            WHERE username=? AND status='ACTIVE'
+            LIMIT 1
+            """,
+            (username,),
+        ).fetchone()
+
+        if not remaining:
+            conn.execute(
+                "UPDATE users SET certificate_status='NONE' WHERE username=?",
+                (username,),
+            )
+            remove_user_certificate(username)
+
+    conn.execute(
+        """
+        INSERT INTO system_metadata (key, value, updated_at)
+        VALUES ('pki_intermediate_fingerprint', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            value=excluded.value,
+            updated_at=excluded.updated_at
+        """,
+        (fingerprint, now_iso()),
+    )
+
+    return len(affected_users)
 
 def current_pending_login_user(
     authorization: str | None = Header(default=None),
@@ -879,7 +951,11 @@ def startup():
     initialize_pki(auto_init=PKI_AUTO_INIT)
     get_secret()
     conn = db()
+    replaced = reconcile_certificates_after_ca_rotation(conn)
+    conn.commit()
     conn.close()
+    if replaced:
+        print(f"[PKI] {replaced} akun memerlukan penerbitan ulang certificate.")
 
 
 @app.get("/health")
@@ -1692,7 +1768,7 @@ def login_verify(
         certificate_issued = False
         certificate_serial = None
 
-        if not latest_cert:
+        if not latest_cert or latest_cert["status"] == "REPLACED":
             issued = issue_certificate_core(conn, username)
             certificate_issued = True
             certificate_serial = issued["serial_number"]
