@@ -1,4 +1,5 @@
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -58,38 +59,11 @@ PKI_AUTO_INIT = os.environ.get("ONE_MIND_PKI_AUTO_INIT", "true").strip().lower()
 FAILED_LOGINS: dict[str, list[float]] = {}
 ACCOUNT_STATUSES = ("PENDING", "ACTIVE", "REJECTED", "DELETED")
 CERTIFICATE_STATUSES = ("NONE", "ISSUED", "REVOKED", "EXPIRED", "REPLACED")
+FILE_STORAGE_FORMAT = "chunked-v1"
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-def merge_chunks(upload_id: str) -> Path:
-
-    upload_dir = TEMP_UPLOAD_DIR / upload_id
-
-    merged_path = upload_dir / "merged_ciphertext.bin"
-
-    with open(merged_path, "wb") as merged:
-
-        chunk_files = sorted(
-            upload_dir.glob("chunk_*.bin")
-        )
-
-        if not chunk_files:
-            raise RuntimeError(
-                "Tidak ada chunk yang ditemukan."
-            )
-
-        for chunk in chunk_files:
-
-            with open(chunk, "rb") as f:
-
-                shutil.copyfileobj(
-                    f,
-                    merged
-                )
-
-    return merged_path
 
 def cleanup_upload_sessions():
 
@@ -148,14 +122,25 @@ def b64d(text: str) -> bytes:
 def new_id(n: int = 16) -> str:
     return secrets.token_hex(n // 2)
 
-def envelope_path(file_id: str, create_dir: bool = True) -> Path:
+def file_storage_dir(file_id: str, create_parent: bool = True) -> Path:
     shard = file_id[:2].lower()
-    folder = STORAGE_DIR / shard
+    shard_dir = STORAGE_DIR / shard
 
+    if create_parent:
+        shard_dir.mkdir(parents=True, exist_ok=True)
+
+    return shard_dir / file_id
+
+
+def envelope_path(file_id: str, create_dir: bool = True) -> Path:
+    folder = file_storage_dir(file_id, create_parent=create_dir)
     if create_dir:
         folder.mkdir(parents=True, exist_ok=True)
+    return folder / "envelope.json"
 
-    return folder / f"{file_id}.json"
+
+def ciphertext_chunk_path(file_id: str, chunk_index: int) -> Path:
+    return file_storage_dir(file_id, create_parent=False) / f"chunk_{chunk_index:06d}.bin"
 
 
 def get_secret() -> bytes:
@@ -406,6 +391,11 @@ def db() -> sqlite3.Connection:
             envelope_name TEXT NOT NULL,
             encrypted_size INTEGER NOT NULL,
             is_hidden INTEGER NOT NULL DEFAULT 1,
+            storage_format TEXT NOT NULL DEFAULT 'chunked-v1',
+            chunk_size INTEGER NOT NULL DEFAULT 0,
+            total_chunks INTEGER NOT NULL DEFAULT 0,
+            ciphertext_size INTEGER NOT NULL DEFAULT 0,
+            ciphertext_sha256 TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             FOREIGN KEY(owner) REFERENCES users(username)
         );
@@ -549,6 +539,33 @@ def db() -> sqlite3.Connection:
         conn.execute(
             "ALTER TABLE files ADD COLUMN is_hidden INTEGER NOT NULL DEFAULT 1"
         )
+
+    file_migrations = [
+        (
+            "storage_format",
+            "ALTER TABLE files ADD COLUMN storage_format TEXT NOT NULL DEFAULT 'chunked-v1'",
+        ),
+        (
+            "chunk_size",
+            "ALTER TABLE files ADD COLUMN chunk_size INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "total_chunks",
+            "ALTER TABLE files ADD COLUMN total_chunks INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "ciphertext_size",
+            "ALTER TABLE files ADD COLUMN ciphertext_size INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "ciphertext_sha256",
+            "ALTER TABLE files ADD COLUMN ciphertext_sha256 TEXT NOT NULL DEFAULT ''",
+        ),
+    ]
+
+    for column_name, sql in file_migrations:
+        if column_name not in file_columns:
+            conn.execute(sql)
 
     # ==========================================================
     # USERS MIGRATION
@@ -916,15 +933,15 @@ class ShareIn(BaseModel):
     wrapped_key: dict
     permission: Literal["viewer", "editor"] = "viewer"
 class UploadStartIn(BaseModel):
-    filename: str
-    file_size: int
-    chunk_size: int
-    total_chunks: int
+    filename: str = Field(min_length=1, max_length=240)
+    file_size: int = Field(gt=0)
+    chunk_size: int = Field(gt=0)
+    total_chunks: int = Field(gt=0)
 
 class UploadChunkIn(BaseModel):
     upload_id: str
-    chunk_index: int
-    total_chunks: int
+    chunk_index: int = Field(ge=0)
+    total_chunks: int = Field(gt=0)
     data_b64: str
 
 class UploadFinishIn(BaseModel):
@@ -2351,6 +2368,15 @@ def upload_start(
 ):
     cleanup_upload_sessions()
 
+    expected_total_chunks = (
+        data.file_size + data.chunk_size - 1
+    ) // data.chunk_size
+    if data.total_chunks != expected_total_chunks:
+        raise HTTPException(
+            status_code=400,
+            detail="total_chunks tidak sesuai ukuran ciphertext dan chunk.",
+        )
+
     upload_id = new_id()
 
     upload_dir = TEMP_UPLOAD_DIR / upload_id
@@ -2408,7 +2434,7 @@ def upload_chunk(
 
     row = conn.execute(
         """
-        SELECT owner, total_chunks
+        SELECT owner, file_size, chunk_size, total_chunks
         FROM upload_sessions
         WHERE id = ?;
         """,
@@ -2429,18 +2455,18 @@ def upload_chunk(
             detail="Upload session bukan milik Anda."
         )
 
-    if data.chunk_index < 0:
-        conn.close()
-        raise HTTPException(
-            status_code=400,
-            detail="chunk_index tidak boleh negatif."
-        )
-
     if data.chunk_index >= row["total_chunks"]:
         conn.close()
         raise HTTPException(
             status_code=400,
             detail="chunk_index melebihi total_chunks."
+        )
+
+    if data.total_chunks != row["total_chunks"]:
+        conn.close()
+        raise HTTPException(
+            status_code=400,
+            detail="total_chunks tidak cocok dengan sesi upload.",
         )
 
     upload_dir = TEMP_UPLOAD_DIR / data.upload_id
@@ -2456,18 +2482,37 @@ def upload_chunk(
         upload_dir /
         f"chunk_{data.chunk_index:06d}.bin"
     )
-
-    # Jika chunk sudah pernah diterima, jangan hitung lagi
-    if chunk_path.exists():
-        conn.close()
-        return {
-            "message": "Chunk already received."
-        }
+    temp_chunk_path = None
 
     try:
-        chunk_bytes = base64.b64decode(data.data_b64)
+        chunk_bytes = base64.b64decode(data.data_b64, validate=True)
 
-        chunk_path.write_bytes(chunk_bytes)
+        expected_size = min(
+            row["chunk_size"],
+            row["file_size"] - (data.chunk_index * row["chunk_size"]),
+        )
+        if expected_size <= 0 or len(chunk_bytes) != expected_size:
+            raise HTTPException(
+                status_code=400,
+                detail="Ukuran chunk tidak sesuai metadata sesi upload.",
+            )
+
+        # Upload ulang chunk yang sudah lengkap bersifat idempotent.
+        if chunk_path.exists():
+            if chunk_path.stat().st_size != expected_size:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Chunk yang tersimpan memiliki ukuran tidak konsisten.",
+                )
+            return {
+                "message": "Chunk already received.",
+                "chunk": data.chunk_index,
+                "received": expected_size,
+            }
+
+        temp_chunk_path = upload_dir / f".chunk_{data.chunk_index:06d}.tmp"
+        temp_chunk_path.write_bytes(chunk_bytes)
+        temp_chunk_path.replace(chunk_path)
 
         conn.execute(
             """
@@ -2480,6 +2525,21 @@ def upload_chunk(
 
         conn.commit()
 
+    except HTTPException:
+
+        conn.rollback()
+
+        raise
+
+    except (binascii.Error, ValueError, TypeError) as e:
+
+        conn.rollback()
+
+        raise HTTPException(
+            status_code=400,
+            detail="Data Base64 chunk tidak valid.",
+        ) from e
+
     except Exception as e:
 
         conn.rollback()
@@ -2490,6 +2550,10 @@ def upload_chunk(
         )
 
     finally:
+
+        if temp_chunk_path is not None and temp_chunk_path.exists():
+            temp_chunk_path.unlink()
+
         conn.close()
 
     return {
@@ -2502,18 +2566,19 @@ def upload_finish(
     data: UploadFinishIn,
     username: str = Depends(current_user)
 ):
-
     conn = db()
-
-    envelope_file = None
+    upload_dir = TEMP_UPLOAD_DIR / data.upload_id
+    target_dir = None
+    moved_to_storage = False
 
     try:
-
         row = conn.execute(
             """
             SELECT
                 owner,
                 filename,
+                file_size,
+                chunk_size,
                 uploaded_chunks,
                 total_chunks
             FROM upload_sessions
@@ -2534,81 +2599,85 @@ def upload_finish(
                 detail="Upload session bukan milik Anda."
             )
 
-        if row["uploaded_chunks"] != row["total_chunks"]:
+        if not upload_dir.exists():
+            raise HTTPException(
+                status_code=404,
+                detail="Folder upload tidak ditemukan.",
+            )
+
+        expected_paths = [
+            upload_dir / f"chunk_{index:06d}.bin"
+            for index in range(row["total_chunks"])
+        ]
+        if (
+            row["uploaded_chunks"] != row["total_chunks"]
+            or any(not path.is_file() for path in expected_paths)
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="Masih ada chunk yang belum diterima."
             )
 
-        merged_path = merge_chunks(
-            data.upload_id
-        )
+        digest = hashlib.sha256()
+        ciphertext_size = 0
+        for index, chunk_file in enumerate(expected_paths):
+            expected_size = min(
+                row["chunk_size"],
+                row["file_size"] - (index * row["chunk_size"]),
+            )
+            actual_size = chunk_file.stat().st_size
+            if expected_size <= 0 or actual_size != expected_size:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Ukuran chunk {index} tidak konsisten.",
+                )
+            ciphertext_size += actual_size
+            with chunk_file.open("rb") as source:
+                while block := source.read(1024 * 1024):
+                    digest.update(block)
 
-        if not merged_path.exists():
+        if ciphertext_size != row["file_size"]:
             raise HTTPException(
-                status_code=500,
-                detail="Gagal menggabungkan chunk."
+                status_code=409,
+                detail="Ukuran ciphertext gabungan tidak sesuai sesi upload.",
             )
 
-        merged_bytes = merged_path.read_bytes()
+        for temporary_path in upload_dir.glob(".chunk_*.tmp"):
+            temporary_path.unlink()
 
-        if len(merged_bytes) == 0:
-            raise HTTPException(
-                status_code=500,
-                detail="Hasil merge kosong."
-            )
-
-        # ====================================================
-        # INTEGRITY CHECK
-        # ====================================================
-
-        server_sha256 = base64.b64encode(
-            hashlib.sha256(
-                merged_bytes
-            ).digest()
-        ).decode("ascii")
-
-        if server_sha256 != data.ciphertext_sha256:
+        server_sha256 = base64.b64encode(digest.digest()).decode("ascii")
+        if not hmac.compare_digest(server_sha256, data.ciphertext_sha256):
             raise HTTPException(
                 status_code=409,
                 detail="Integrity check gagal. Ciphertext berubah selama upload."
             )
 
-        # ====================================================
-
         file_id = new_id()
-
         envelope = data.envelope.copy()
-
-        # ====================================================
-        # Metadata Identitas File
-        # ====================================================
-
+        envelope.pop("ciphertext_b64", None)
         envelope["file_id"] = file_id
         envelope["version"] = 1
         envelope["uploaded_at"] = now_iso()
+        envelope["storage_format"] = FILE_STORAGE_FORMAT
+        envelope["chunk_size"] = row["chunk_size"]
+        envelope["total_chunks"] = row["total_chunks"]
+        envelope["ciphertext_size"] = ciphertext_size
+        envelope["ciphertext_sha256"] = server_sha256
 
-        # ====================================================
-        # Ciphertext
-        # ====================================================
-
-        envelope["ciphertext_b64"] = base64.b64encode(
-            merged_bytes
-        ).decode("ascii")
-
-        envelope_bytes = json.dumps(
-            envelope,
-            ensure_ascii=False,
-            separators=(",", ":")
-        ).encode("utf-8")
-
-        envelope_name = f"{file_id}.json"
-
-        envelope_file = envelope_path(file_id)
-
-        envelope_file.write_bytes(
-            envelope_bytes
+        (upload_dir / "envelope.json").write_text(
+            json.dumps(
+                envelope,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
         )
+
+        target_dir = file_storage_dir(file_id)
+        if target_dir.exists():
+            raise RuntimeError("Folder penyimpanan file sudah ada.")
+        upload_dir.replace(target_dir)
+        moved_to_storage = True
 
         conn.execute(
             """
@@ -2620,20 +2689,30 @@ def upload_finish(
                 envelope_name,
                 encrypted_size,
                 is_hidden,
+                storage_format,
+                chunk_size,
+                total_chunks,
+                ciphertext_size,
+                ciphertext_sha256,
                 created_at
             )
             VALUES
-            (?, ?, ?, ?, ?, ?, ?)
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 file_id,
                 username,
                 row["filename"],
-                envelope_name,
-                len(envelope_bytes),
+                "envelope.json",
+                ciphertext_size,
                 int(data.is_hidden),
-                now_iso()
-            )
+                FILE_STORAGE_FORMAT,
+                row["chunk_size"],
+                row["total_chunks"],
+                ciphertext_size,
+                server_sha256,
+                now_iso(),
+            ),
         )
 
         conn.execute(
@@ -2658,45 +2737,35 @@ def upload_finish(
                 username,
                 json.dumps(data.wrapped_key_for_owner),
                 "owner",
-                now_iso()
-            )
+                now_iso(),
+            ),
         )
 
         conn.execute(
-            """
-            DELETE FROM upload_sessions
-            WHERE id = ?;
-            """,
-            (
-                data.upload_id,
-            )
+            "DELETE FROM upload_sessions WHERE id=?",
+            (data.upload_id,),
         )
-
         conn.commit()
 
     except Exception:
-
         conn.rollback()
-
-        if envelope_file is not None and envelope_file.exists():
-            envelope_file.unlink()
-
+        if moved_to_storage and target_dir is not None and target_dir.exists():
+            if upload_dir.exists():
+                shutil.rmtree(upload_dir, ignore_errors=True)
+            target_dir.replace(upload_dir)
+            moved_to_storage = False
+        pending_envelope = upload_dir / "envelope.json"
+        if pending_envelope.exists():
+            pending_envelope.unlink()
         raise
 
     finally:
-
         conn.close()
 
-    upload_dir = TEMP_UPLOAD_DIR / data.upload_id
-
-    if upload_dir.exists():
-        shutil.rmtree(
-            upload_dir,
-            ignore_errors=True
-        )
-
     return {
-        "file_id": file_id
+        "file_id": file_id,
+        "storage_format": FILE_STORAGE_FORMAT,
+        "total_chunks": row["total_chunks"],
     }
 
 @app.get("/api/files")
@@ -2712,6 +2781,11 @@ def list_files(username: str =Depends(current_user)):
             f.filename,
             f.encrypted_size,
             f.is_hidden,
+            f.storage_format,
+            f.chunk_size,
+            f.total_chunks,
+            f.ciphertext_size,
+            f.ciphertext_sha256,
             f.created_at,
             f.envelope_name,
             s.permission
@@ -2761,6 +2835,8 @@ def download_file(file_id: str, username: str = Depends(current_user)):
     row = conn.execute(
         """
         SELECT f.id, f.owner, f.filename, f.envelope_name,
+               f.storage_format, f.chunk_size, f.total_chunks,
+               f.ciphertext_size, f.ciphertext_sha256,
                s.wrapped_key, s.permission
         FROM files f
         JOIN shares s
@@ -2791,7 +2867,74 @@ def download_file(file_id: str, username: str = Depends(current_user)):
         "permission": row["permission"],
         "envelope": json.loads(env_path.read_text()),
         "wrapped_key": json.loads(row["wrapped_key"]),
+        "download": {
+            "storage_format": row["storage_format"],
+            "chunk_size": row["chunk_size"],
+            "total_chunks": row["total_chunks"],
+            "ciphertext_size": row["ciphertext_size"],
+            "ciphertext_sha256": row["ciphertext_sha256"],
+        },
     }
+
+
+@app.get("/api/files/{file_id}/chunks/{chunk_index}")
+def download_file_chunk(
+    file_id: str,
+    chunk_index: int,
+    username: str = Depends(current_user),
+):
+    conn = db()
+    row = conn.execute(
+        """
+        SELECT f.storage_format, f.chunk_size, f.total_chunks, f.ciphertext_size
+        FROM files f
+        JOIN shares s ON s.file_id=f.id
+        WHERE f.id=? AND s.recipient=?
+        """,
+        (file_id, username),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="File tidak ditemukan atau belum dibagikan ke akun ini.",
+        )
+    if row["storage_format"] != FILE_STORAGE_FORMAT:
+        raise HTTPException(
+            status_code=409,
+            detail="Format penyimpanan file tidak mendukung download chunk.",
+        )
+    if chunk_index < 0 or chunk_index >= row["total_chunks"]:
+        raise HTTPException(
+            status_code=416,
+            detail="Indeks chunk berada di luar rentang file.",
+        )
+
+    chunk_file = ciphertext_chunk_path(file_id, chunk_index)
+    expected_size = min(
+        row["chunk_size"],
+        row["ciphertext_size"] - (chunk_index * row["chunk_size"]),
+    )
+    if (
+        expected_size <= 0
+        or not chunk_file.is_file()
+        or chunk_file.stat().st_size != expected_size
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail="Chunk ciphertext tidak tersedia atau tidak konsisten.",
+        )
+
+    return FileResponse(
+        chunk_file,
+        media_type="application/octet-stream",
+        headers={
+            "X-Chunk-Index": str(chunk_index),
+            "X-Total-Chunks": str(row["total_chunks"]),
+            "X-Ciphertext-Size": str(row["ciphertext_size"]),
+        },
+    )
 
 @app.get("/api/files/{file_id}/access")
 def file_access(file_id: str, username: str = Depends(current_user)):
@@ -2865,100 +3008,144 @@ def update_file_visibility(
 @app.put("/api/files/{file_id}")
 def update_file(file_id: str, data: FileUpdateIn, username: str = Depends(current_user)):
     conn = db()
+    staging_dir = None
+    backup_dir = None
+    swapped = False
 
-    require_file_permission(conn, file_id, username, {"owner", "editor"})
+    try:
+        require_file_permission(conn, file_id, username, {"owner", "editor"})
+        row = conn.execute(
+            "SELECT chunk_size, storage_format FROM files WHERE id=?",
+            (file_id,),
+        ).fetchone()
+        if not row or row["storage_format"] != FILE_STORAGE_FORMAT:
+            raise HTTPException(
+                status_code=409,
+                detail="Format penyimpanan file tidak dapat di-update.",
+            )
 
-    expected_recipients = access_usernames(conn, file_id)
-    submitted_recipients = {item.recipient for item in data.wrapped_keys}
+        ciphertext_text = data.envelope.get("ciphertext_b64")
+        if not isinstance(ciphertext_text, str):
+            raise HTTPException(
+                status_code=400,
+                detail="Ciphertext update tidak tersedia.",
+            )
+        try:
+            ciphertext = base64.b64decode(ciphertext_text, validate=True)
+        except (binascii.Error, ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Ciphertext update bukan Base64 yang valid.",
+            ) from exc
+        if not ciphertext:
+            raise HTTPException(status_code=400, detail="Ciphertext update kosong.")
 
-    if submitted_recipients != expected_recipients:
-        conn.close()
-        raise HTTPException(
-            status_code=400,
-            detail="Wrapped key harus dibuat ulang untuk semua user yang masih punya akses.",
+        chunk_size = row["chunk_size"]
+        if chunk_size <= 0:
+            raise HTTPException(status_code=500, detail="Metadata chunk file tidak valid.")
+        total_chunks = (len(ciphertext) + chunk_size - 1) // chunk_size
+        ciphertext_sha256 = base64.b64encode(
+            hashlib.sha256(ciphertext).digest()
+        ).decode("ascii")
+
+        target_dir = file_storage_dir(file_id)
+        staging_dir = target_dir.parent / f".{file_id}.update-{new_id()}"
+        backup_dir = target_dir.parent / f".{file_id}.backup-{new_id()}"
+        staging_dir.mkdir(parents=False, exist_ok=False)
+
+        envelope = data.envelope.copy()
+        envelope.pop("ciphertext_b64", None)
+        envelope["storage_format"] = FILE_STORAGE_FORMAT
+        envelope["chunk_size"] = chunk_size
+        envelope["total_chunks"] = total_chunks
+        envelope["ciphertext_size"] = len(ciphertext)
+        envelope["ciphertext_sha256"] = ciphertext_sha256
+        (staging_dir / "envelope.json").write_text(
+            json.dumps(envelope, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
         )
+        for index in range(total_chunks):
+            start = index * chunk_size
+            end = min(start + chunk_size, len(ciphertext))
+            (staging_dir / f"chunk_{index:06d}.bin").write_bytes(
+                ciphertext[start:end]
+            )
 
-    row = conn.execute(
-        "SELECT id FROM files WHERE id=?",
-        (file_id,)
-    ).fetchone()
+        conn.execute("BEGIN IMMEDIATE")
+        require_file_permission(conn, file_id, username, {"owner", "editor"})
+        expected_recipients = access_usernames(conn, file_id)
+        submitted_recipients = {item.recipient for item in data.wrapped_keys}
+        if submitted_recipients != expected_recipients:
+            raise HTTPException(
+                status_code=400,
+                detail="Wrapped key harus dibuat ulang untuk semua user yang masih punya akses.",
+            )
 
-    if not row:
-        conn.close()
-        raise HTTPException(
-            status_code=404,
-            detail="File tidak ditemukan."
-        )
+        if not target_dir.is_dir():
+            raise HTTPException(status_code=500, detail="Folder file aktif tidak ditemukan.")
+        target_dir.replace(backup_dir)
+        staging_dir.replace(target_dir)
+        swapped = True
 
-    # ==========================================
-    # DEBUG
-    # ==========================================
-
-    print("\n========== UPDATE BACKEND ==========")
-    print("Envelope type:", type(data.envelope))
-    print("Envelope keys:", list(data.envelope.keys()))
-    print("Has ciphertext:", "ciphertext_b64" in data.envelope)
-
-    if "ciphertext_b64" in data.envelope:
-        print(
-            "Cipher length:",
-            len(data.envelope["ciphertext_b64"])
-        )
-
-    print("====================================\n")
-
-    # ==========================================
-
-    envelope_bytes = json.dumps(
-        data.envelope,
-        ensure_ascii=False,
-        separators=(",", ":")
-    ).encode("utf-8")
-
-    envelope_path(file_id).write_bytes(
-        envelope_bytes
-    )
-
-    conn.execute(
-        "UPDATE files SET filename=?, encrypted_size=? WHERE id=?",
-        (
-            data.filename,
-            len(envelope_bytes),
-            file_id,
-        ),
-    )
-
-    for item in data.wrapped_keys:
         conn.execute(
-            "UPDATE shares SET wrapped_key=? WHERE file_id=? AND recipient=?",
+            """
+            UPDATE files
+            SET filename=?, encrypted_size=?, total_chunks=?,
+                ciphertext_size=?, ciphertext_sha256=?
+            WHERE id=?
+            """,
             (
-                json.dumps(item.wrapped_key),
+                data.filename,
+                len(ciphertext),
+                total_chunks,
+                len(ciphertext),
+                ciphertext_sha256,
                 file_id,
-                item.recipient,
             ),
         )
+        for item in data.wrapped_keys:
+            conn.execute(
+                "UPDATE shares SET wrapped_key=? WHERE file_id=? AND recipient=?",
+                (json.dumps(item.wrapped_key), file_id, item.recipient),
+            )
+        conn.commit()
+        swapped = False
+        shutil.rmtree(backup_dir, ignore_errors=True)
 
-    conn.commit()
-    conn.close()
+    except Exception:
+        conn.rollback()
+        if swapped and backup_dir is not None and backup_dir.exists():
+            active_dir = file_storage_dir(file_id)
+            if active_dir.exists():
+                shutil.rmtree(active_dir)
+            backup_dir.replace(active_dir)
+        if staging_dir is not None and staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+    finally:
+        conn.close()
 
     return {
-        "ok": True
+        "ok": True,
+        "storage_format": FILE_STORAGE_FORMAT,
+        "total_chunks": total_chunks,
     }
 
 @app.delete("/api/files/{file_id}")
 def delete_file(file_id: str, username: str = Depends(current_user)):
     conn = db()
     require_file_permission(conn, file_id, username, {"owner"})
-    row = conn.execute("SELECT envelope_name FROM files WHERE id=?", (file_id,)).fetchone()
+    row = conn.execute("SELECT id FROM files WHERE id=?", (file_id,)).fetchone()
     conn.execute("DELETE FROM file_requests WHERE file_id=?", (file_id,))
     conn.execute("DELETE FROM shares WHERE file_id=?", (file_id,))
     conn.execute("DELETE FROM files WHERE id=?", (file_id,))
     conn.commit()
     conn.close()
     if row:
-        env_path = envelope_path(file_id, create_dir=False)
-        if env_path.exists():
-            env_path.unlink()
+        storage_dir = file_storage_dir(file_id, create_parent=False)
+        if storage_dir.exists():
+            shutil.rmtree(storage_dir)
     return {"ok": True}
 
 

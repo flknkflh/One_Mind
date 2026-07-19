@@ -23,9 +23,10 @@ docker run --rm -e ONE_MIND_DATA_DIR=/tmp/one-mind-tests one-mind-tests
 
 Suite ini memverifikasi baseline password, integritas token, RSA
 proof-of-possession, validasi issuer/signature certificate, deteksi rotasi CA,
-dan penerbitan ulang certificate setelah RSA proof yang valid.
+penerbitan ulang certificate setelah RSA proof yang valid, serta penyimpanan,
+otorisasi, integritas, update, dan download ciphertext per chunk.
 
-> Status dokumentasi: diselaraskan dengan kode repository pada 18 Juli 2026. Implementasi saat ini berbeda dari rancangan lama yang menyimpan private key terenkripsi di `localStorage`.
+> Status dokumentasi: diselaraskan dengan kode repository pada 19 Juli 2026. Implementasi saat ini berbeda dari rancangan lama yang menyimpan private key terenkripsi di `localStorage`.
 
 ## Menjalankan Secara Lokal
 
@@ -83,13 +84,23 @@ Browser:
 5. mengirim ciphertext dalam beberapa chunk sesuai ukuran file;
 6. menyelesaikan upload dengan envelope, hash, dan wrapped key pemilik.
 
-Server memverifikasi hash ciphertext gabungan lalu menyimpan envelope ciphertext dan metadata file.
+Server memverifikasi ukuran setiap chunk serta SHA-256 seluruh ciphertext secara
+incremental. Chunk yang lolos disimpan permanen sebagai file biner terpisah;
+envelope JSON hanya memuat metadata enkripsi dan deskriptor download, bukan
+`ciphertext_b64`.
 
 Saat upload, owner memilih file disembunyikan atau ditampilkan pada katalog internal. File lama dan pilihan default tetap tersembunyi. Katalog hanya menampilkan metadata; ciphertext dan key tidak diberikan kepada user yang belum mempunyai akses.
 
 ### 5. Download dan berbagi
 
-Server hanya mengembalikan file kepada akun yang memiliki record akses. Browser membuka wrapped key memakai DIPP private key di RAM, lalu mendekripsi ciphertext.
+Server hanya mengembalikan metadata dan chunk kepada akun yang memiliki record
+akses. Browser mengambil chunk secara berurutan (maksimal tiga percobaan per
+chunk), memverifikasi ukuran dan SHA-256 ciphertext, membuka wrapped key memakai
+DIPP private key di RAM, lalu mendekripsi ciphertext.
+
+Download tidak lagi meminta satu envelope JSON besar. Namun implementasi
+AES-GCM saat ini masih merakit seluruh ciphertext di RAM browser sebelum
+dekripsi, sehingga kebutuhan RAM untuk file sangat besar belum hilang.
 
 Owner dapat membagikan file sebagai `viewer` atau `editor`. Owner membuka AES key secara lokal dan membungkusnya kembali untuk DIPP public key penerima. Owner dapat mencabut akses; rotasi key diperlukan untuk melindungi versi file berikutnya dari key lama yang mungkin sudah diperoleh penerima.
 
@@ -115,7 +126,7 @@ Sementara di RAM tab:
 - AES file key selama operasi file;
 - plaintext file selama enkripsi/dekripsi;
 - password/form data selama request;
-- daftar file, envelope/ciphertext, daftar pengguna, dan metadata UI.
+- daftar file, envelope, ciphertext yang sedang diproses, daftar pengguna, dan metadata UI.
 
 Auto-lock private key 15 menit belum aktif dalam kode saat ini. Key di RAM dibersihkan saat logout, refresh, tab ditutup, proses browser berhenti, atau state login direset.
 
@@ -126,7 +137,7 @@ Server menyimpan:
 - SQLite database pengguna, administrator, certificate, audit admin, file, share, dan sesi upload;
 - hash password;
 - DIPP dan RSA public key;
-- ciphertext/envelope;
+- chunk ciphertext biner dan envelope metadata;
 - wrapped AES key setiap penerima;
 - `server_secret.bin` untuk menandatangani token;
 - private key TLS dan private key CA pada deployment/repository saat ini.

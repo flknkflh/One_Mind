@@ -487,6 +487,23 @@ button.danger:hover {
   margin: 0;
 }
 
+.downloadProgress {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 11px 13px;
+  color: var(--ink-soft);
+  background: var(--surface-soft);
+  font-size: 12px;
+}
+
+.downloadProgress progress {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
 .list {
   display: grid;
   gap: 11px;

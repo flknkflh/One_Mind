@@ -1,6 +1,6 @@
 # Manual Sistem ONE_MIND
 
-Versi dokumentasi: 18 Juli 2026
+Versi dokumentasi: 19 Juli 2026
 Dasar dokumentasi: perilaku kode pada `app/main.py`, `static/app.js`, konfigurasi Docker, dan skema SQLite aktual.
 
 ## 1. Ringkasan
@@ -15,7 +15,7 @@ ONE_MIND adalah prototipe web drive terenkripsi dengan:
 - approval dan pengelolaan akun oleh administrator;
 - akses file `owner`, `editor`, dan `viewer`;
 - upload ciphertext bertahap/chunked;
-- SQLite dan file JSON envelope pada server.
+- SQLite, file JSON envelope metadata, dan chunk ciphertext biner pada server.
 
 Server tidak dirancang menerima plaintext file atau private key pengguna. Walaupun demikian, frontend berasal dari server sehingga operator yang mengubah JavaScript dapat mengakses data sensitif pada browser. Sistem ini masih prototipe, bukan produk siap menangani data sensitif.
 
@@ -54,7 +54,8 @@ Dalam mode lokal, `ONE_MIND_DATA_DIR=/app/data` berisi:
 
 - `database/one_mind.sqlite3`
 - `keys/server_secret.bin`
-- `storage/<shard>/<file_id>.json`
+- `storage/<shard>/<file_id>/envelope.json`
+- `storage/<shard>/<file_id>/chunk_<index>.bin`
 - temporary upload directory yang dibuat aplikasi
 
 TLS lokal memakai `/app/certs/server.crt` dan `/app/certs/server.key`.
@@ -74,7 +75,9 @@ Tabel utama:
 - `upload_sessions`: metadata dan progres upload chunk;
 - tabel certificate request/revocation untuk state PKI terkait.
 
-Envelope file JSON memuat metadata enkripsi seperti algoritma/IV serta `ciphertext_b64`. Wrapped key disimpan terpisah per penerima pada tabel `shares`.
+Envelope file JSON memuat metadata enkripsi seperti algoritma/IV dan deskriptor
+chunk. Ciphertext tidak disalin ke `ciphertext_b64`; ciphertext tersimpan sebagai
+file chunk biner. Wrapped key disimpan terpisah per penerima pada tabel `shares`.
 
 ## 4. Status Akun dan Certificate
 
@@ -192,21 +195,25 @@ Refresh atau menutup tab menghilangkan private key dari RAM, tetapi token persis
 5. Browser menghitung SHA-256 ciphertext.
 6. AES key dibungkus untuk DIPP public key owner.
 7. Browser membuat sesi upload, mengirim seluruh chunk base64, lalu melakukan finish.
-8. Server menggabungkan chunk dan membandingkan hash.
-9. Server menyimpan envelope ciphertext, metadata, dan wrapped key owner.
+8. Server memeriksa ukuran tiap chunk dan menghitung SHA-256 seluruh ciphertext secara incremental.
+9. Server memindahkan chunk ke storage permanen dan menyimpan envelope metadata serta wrapped key owner.
 
 Catatan: frontend saat ini mengenkripsi file sebagai satu buffer sebelum ciphertext dibagi menjadi chunk. Untuk file sangat besar, konsumsi RAM browser tetap dapat tinggi meskipun transfer dilakukan bertahap.
 
 ## 10. Daftar dan Download File
 
-`GET /api/files` mengembalikan file yang mempunyai record share untuk akun login, termasuk envelope. Saat download:
+`GET /api/files` mengembalikan file yang mempunyai record share untuk akun login, termasuk envelope metadata. Saat download:
 
 1. browser meminta detail file dan wrapped key milik akun;
-2. DIPP private key dari RAM membuka wrapped AES key;
-3. AES key mendekripsi envelope;
-4. browser membuat `Blob` dan object URL untuk download plaintext.
+2. browser mengambil chunk ciphertext secara berurutan; chunk yang gagal dapat dicoba hingga tiga kali;
+3. browser memeriksa ukuran setiap chunk dan SHA-256 ciphertext lengkap;
+4. DIPP private key dari RAM membuka wrapped AES key;
+5. AES key mendekripsi ciphertext dengan metadata IV/AAD pada envelope;
+6. browser membuat `Blob` dan object URL untuk download plaintext.
 
-Plaintext, AES key, ciphertext, dan buffer terkait dapat berada di RAM selama proses.
+Plaintext, AES key, ciphertext, dan buffer terkait dapat berada di RAM selama
+proses. Chunking download mengurangi ukuran setiap response jaringan, tetapi
+belum membuat dekripsi AES-GCM menjadi streaming.
 
 ## 11. Share dan Permission
 
@@ -310,7 +317,8 @@ Semua endpoint file/user/certificate memerlukan `Authorization: Bearer <token>`,
 | POST | `/api/upload/chunk` | Mengirim chunk ciphertext base64 |
 | POST | `/api/upload/finish` | Verifikasi hash dan simpan file |
 | GET | `/api/files` | Daftar file yang dapat diakses |
-| GET | `/api/files/{file_id}` | Envelope dan wrapped key akun |
+| GET | `/api/files/{file_id}` | Envelope, deskriptor download, dan wrapped key akun |
+| GET | `/api/files/{file_id}/chunks/{chunk_index}` | Download satu chunk ciphertext biner |
 | GET | `/api/files/{file_id}/access` | Daftar penerima/permission/public key |
 | PATCH | `/api/files/{file_id}` | Rename oleh owner/editor |
 | PATCH | `/api/files/{file_id}/visibility` | Hide/tampilkan file oleh owner |
@@ -373,7 +381,10 @@ Periksa koneksi, ukuran/batas proxy, kelengkapan chunk, ruang disk, dan konsiste
 
 ## 17. Backup dan Pemulihan
 
-Backup server harus mencakup database, storage envelope, server secret, dan konfigurasi/certificate yang diperlukan deployment. Kehilangan `server_secret.bin` memutus validitas sesi lama tetapi bukan ciphertext.
+Backup server harus mencakup database, seluruh folder storage envelope/chunk,
+server secret, dan konfigurasi/certificate yang diperlukan deployment. Database
+dan folder storage harus dipulihkan sebagai satu snapshot yang konsisten.
+Kehilangan `server_secret.bin` memutus validitas sesi lama tetapi bukan ciphertext.
 
 Backup server saja tidak cukup untuk memulihkan private key pengguna. Setiap pengguna perlu menyimpan file DIPP dan RSA secara terpisah dalam media terenkripsi. Karena aplikasi belum mengenkripsi export, perlindungan harus diberikan oleh storage/OS/prosedur eksternal.
 

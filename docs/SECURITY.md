@@ -1,6 +1,6 @@
 # Keamanan ONE_MIND
 
-Dokumen ini menjelaskan perilaku kode aktual per 18 Juli 2026, bukan target desain lama.
+Dokumen ini menjelaskan perilaku kode aktual per 19 Juli 2026, bukan target desain lama.
 
 ## Model Keamanan
 
@@ -80,10 +80,16 @@ Rancangan backup terenkripsi PBKDF2 600.000 iterasi yang disebut dokumentasi lam
 
 - Browser membuat AES-256-GCM key acak per versi file.
 - File dienkripsi di browser.
-- SHA-256 ciphertext diverifikasi server setelah seluruh chunk digabungkan.
+- Ukuran setiap chunk dan SHA-256 seluruh ciphertext diverifikasi server secara incremental sebelum upload diselesaikan.
 - Raw AES key diekspor sementara di RAM dan dibungkus untuk setiap penerima menggunakan DIPP-KEM.
-- Server menyimpan ciphertext dan wrapped key, bukan raw AES key.
+- Server menyimpan chunk ciphertext biner, envelope metadata, dan wrapped key, bukan raw AES key.
 - Saat update, browser membuat AES key baru dan wrapped key baru untuk semua pengguna yang masih mempunyai akses.
+
+Saat download, server memeriksa record `shares` pada setiap permintaan chunk.
+Browser merakit chunk, memeriksa SHA-256, lalu menjalankan verifikasi integritas
+AES-GCM saat dekripsi. Chunking menghindari response JSON/Base64 tunggal yang
+besar, tetapi ciphertext dan plaintext tetap dapat berada utuh di RAM browser
+karena AES-GCM masih diterapkan satu kali untuk seluruh file.
 
 GCM memberi kerahasiaan dan integritas jika nonce tidak digunakan ulang dengan key yang sama. Implementasi membuat key dan IV baru untuk setiap enkripsi.
 
@@ -116,7 +122,7 @@ Riwayat repository memuat material yang tidak semestinya masuk source control:
 - TLS server private key;
 - `server_secret.bin`;
 - SQLite database aktif;
-- envelope/ciphertext aktif;
+- envelope/chunk ciphertext aktif;
 - backup wrapped key.
 
 Material tersebut sudah dikeluarkan dari pelacakan branch produksi. Jika repository pernah disalin atau dikirim ke remote, tetap anggap secret terekspos. Bersihkan sejarah Git dengan prosedur yang terkontrol, lalu rotasi/revokasi key dan token-signing secret. Menghapus file dari commit terbaru saja tidak membatalkan kebocoran historis.

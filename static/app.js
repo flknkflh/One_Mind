@@ -264,6 +264,26 @@ async function api(path, options = {}) {
 
 }
 
+async function apiBinary(path) {
+  const headers = {};
+  if (state.token) {
+    headers.Authorization = `Bearer ${state.token}`;
+  }
+  const response = await fetch(path, {headers});
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    const error = new Error(
+      `HTTP ${response.status}\n\n${JSON.stringify(data, null, 2)}`
+    );
+    error.status = response.status;
+    throw error;
+  }
+  return {
+    bytes: new Uint8Array(await response.arrayBuffer()),
+    headers: response.headers,
+  };
+}
+
 async function pendingLoginApi(
     path,
     loginToken,
@@ -1382,11 +1402,95 @@ async function uploadFinish(
     );
 }
 
-async function decryptEnvelope(envelope, key) {
+function setDownloadProgress(received, total, chunkIndex, totalChunks) {
+  const root = $("downloadProgress");
+  const bar = $("downloadProgressBar");
+  const text = $("downloadProgressText");
+  const percent = total > 0 ? Math.floor((received / total) * 100) : 0;
+  root?.classList.remove("hidden");
+  if (bar) bar.value = percent;
+  if (text) {
+    text.textContent = `Mengambil chunk ${chunkIndex + 1} dari ${totalChunks} - ${percent}%`;
+  }
+}
+
+function clearDownloadProgress() {
+  $("downloadProgress")?.classList.add("hidden");
+}
+
+async function fetchCiphertextChunks(file) {
+  const descriptor = file.download || {};
+  const totalChunks = Number(descriptor.total_chunks);
+  const chunkSize = Number(descriptor.chunk_size);
+  const ciphertextSize = Number(descriptor.ciphertext_size);
+
+  if (
+    descriptor.storage_format !== "chunked-v1" ||
+    !Number.isSafeInteger(totalChunks) || totalChunks <= 0 ||
+    !Number.isSafeInteger(chunkSize) || chunkSize <= 0 ||
+    !Number.isSafeInteger(ciphertextSize) || ciphertextSize <= 0
+  ) {
+    throw new Error("Metadata download chunk tidak valid.");
+  }
+
+  const ciphertext = new Uint8Array(ciphertextSize);
+  let offset = 0;
+  for (let index = 0; index < totalChunks; index++) {
+    let chunkResult = null;
+    let lastError = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        chunkResult = await apiBinary(`/api/files/${file.id}/chunks/${index}`);
+        break;
+      } catch (err) {
+        lastError = err;
+        if (err.status && err.status < 500 && err.status !== 429) {
+          throw err;
+        }
+      }
+    }
+    if (!chunkResult) {
+      throw new Error(
+        `Gagal mengambil chunk ${index + 1} setelah 3 percobaan: ${lastError?.message || "error"}`
+      );
+    }
+
+    const expectedSize = Math.min(chunkSize, ciphertextSize - offset);
+    const headerIndex = Number(chunkResult.headers.get("X-Chunk-Index"));
+    const headerTotal = Number(chunkResult.headers.get("X-Total-Chunks"));
+    const headerCiphertextSize = Number(
+      chunkResult.headers.get("X-Ciphertext-Size")
+    );
+    if (
+      chunkResult.bytes.length !== expectedSize ||
+      headerIndex !== index ||
+      headerTotal !== totalChunks ||
+      headerCiphertextSize !== ciphertextSize
+    ) {
+      throw new Error(`Chunk ${index + 1} tidak konsisten dengan metadata file.`);
+    }
+    ciphertext.set(chunkResult.bytes, offset);
+    offset += chunkResult.bytes.length;
+    setDownloadProgress(offset, ciphertextSize, index, totalChunks);
+  }
+
+  if (offset !== ciphertextSize) {
+    throw new Error("Ukuran ciphertext hasil download tidak sesuai metadata.");
+  }
+  const digest = bytesToB64(
+    new Uint8Array(await crypto.subtle.digest("SHA-256", ciphertext))
+  );
+  if (digest !== descriptor.ciphertext_sha256) {
+    throw new Error("SHA-256 ciphertext hasil download tidak cocok.");
+  }
+  return ciphertext;
+}
+
+async function decryptEnvelope(envelope, key, ciphertext) {
   const plain = await crypto.subtle.decrypt(
     {name: "AES-GCM", iv: b64ToBytes(envelope.iv_b64), additionalData: b64ToBytes(envelope.aad_b64)},
     key,
-    b64ToBytes(envelope.ciphertext_b64)
+    ciphertext
   );
   return new Blob([plain], {type: envelope.mime || "application/octet-stream"});
 }
@@ -1475,9 +1579,12 @@ async function updateFileWithRotation(fileId, replacementFile) {
 
     const current = await getFileKey(fileId);
 
+    const currentCiphertext = await fetchCiphertextChunks(current.file);
+
     await decryptEnvelope(
         current.file.envelope,
-        current.fileKey
+        current.fileKey,
+        currentCiphertext
     );
 
     const encrypted = await encryptFile(
@@ -1523,9 +1630,12 @@ async function rotateCurrentFileKey(fileId) {
 
     const current = await getFileKey(fileId);
 
+    const currentCiphertext = await fetchCiphertextChunks(current.file);
+
     const blob = await decryptEnvelope(
         current.file.envelope,
-        current.fileKey
+        current.fileKey,
+        currentCiphertext
     );
 
     const sameFile = new File(
@@ -2929,14 +3039,22 @@ on("fileList", "click", async (evt) => {
     return;
   }
   if (!btn.dataset.download) return;
-  const {file, fileKey} = await getFileKey(btn.dataset.download);
-  const blob = await decryptEnvelope(file.envelope, fileKey);
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = file.filename;
-  a.click();
-  URL.revokeObjectURL(url);
+  try {
+    const {file, fileKey} = await getFileKey(btn.dataset.download);
+    const ciphertext = await fetchCiphertextChunks(file);
+    const blob = await decryptEnvelope(file.envelope, fileKey, ciphertext);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = file.filename;
+    a.click();
+    URL.revokeObjectURL(url);
+    showNotice("Download dan dekripsi file selesai.");
+  } catch (err) {
+    alert(err.message || err);
+  } finally {
+    clearDownloadProgress();
+  }
 });
 
 on("refreshFilesBtn", "click", refreshAll);
@@ -3023,7 +3141,13 @@ on("rotateKeyBtn", "click", async () => {
     showNotice("Pilih file dulu.");
     return;
   }
-  await rotateCurrentFileKey(fileId);
+  try {
+    await rotateCurrentFileKey(fileId);
+  } catch (err) {
+    alert(err.message || err);
+  } finally {
+    clearDownloadProgress();
+  }
 });
 on("accessList", "click", async (evt) => {
   const btn = evt.target.closest("[data-revoke]");
@@ -3059,6 +3183,8 @@ on("updateFileInput", "change", async (evt) => {
     finally {
 
         state.pendingUpdateFileId = null;
+
+        clearDownloadProgress();
 
         if (input) {
 
