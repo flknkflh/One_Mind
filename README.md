@@ -19,14 +19,17 @@ ikut masuk image produksi:
 ```bash
 docker build --target test -t one-mind-tests .
 docker run --rm -e ONE_MIND_DATA_DIR=/tmp/one-mind-tests one-mind-tests
+node tests/test_dipp_parameters.js
 ```
 
 Suite ini memverifikasi baseline password, integritas token, RSA
 proof-of-possession, validasi issuer/signature certificate, deteksi rotasi CA,
 penerbitan ulang certificate setelah RSA proof yang valid, serta penyimpanan,
 otorisasi, integritas, update, dan download ciphertext per chunk.
+Test Node terpisah memverifikasi parameter DIPP v2, reliabilitas wrap–unwrap,
+dan kompatibilitas public key DIPP v1.
 
-> Status dokumentasi: diselaraskan dengan kode repository pada 19 Juli 2026. Implementasi saat ini berbeda dari rancangan lama yang menyimpan private key terenkripsi di `localStorage`.
+> Status dokumentasi: diselaraskan dengan kode repository pada 20 Juli 2026. Implementasi saat ini berbeda dari rancangan lama yang menyimpan private key terenkripsi di `localStorage`.
 
 ## Menjalankan Secara Lokal
 

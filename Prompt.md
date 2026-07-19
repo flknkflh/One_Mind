@@ -44,7 +44,7 @@ Registration collects:
 - DIPP public key;
 - RSA login public key.
 
-The browser generates DIPP and RSA keypairs. The server stores both public keys and a PBKDF2-SHA-256 password hash. A new account is `PENDING` until administrator approval.
+The browser generates DIPP and RSA keypairs. New DIPP identities use the version 2 parameter profile (`n_pub=20`, `dim=3`, `coord_max=1000`, `delta_range=[-0.1,0.1]`, `q=4096`, `scale=100`, `error_bound=8`, `error_geser=0`, `dither_bound=0`, `v_shift_bound=8`, and `repeat=5`). Version 1 DIPP public keys remain readable through zero-value fallbacks for the two new noise fields. The server stores both public keys and an Argon2id password hash; legacy PBKDF2 hashes are upgraded after a valid login. A new account is `PENDING` until administrator approval.
 
 The browser exports DIPP and RSA identity files. **Current exports contain unencrypted private-key material.** Do not claim that backup export uses PBKDF2 600,000 iterations or AES-GCM; that was an earlier design and is not the active implementation.
 

@@ -612,16 +612,20 @@ async function adminApi(path, options = {}) {
 }
 
 
+const DIPP_ALGORITHM_NAME = "DIPP-KEM-v2 (Weiszfeld, parameter optimasi 2026)";
+const DIPP_VERSION = 2;
 const DIPP_PARAMS = {
   dim: 3,
-  n_pub: 40,
+  n_pub: 20,
   coord_max: 1000,
   w_range: [0.01, 0.15],
   delta_range: [-0.1, 0.1],
-  q: 2 ** 16,
+  q: 4096,
   scale: 100,
-  error_bound: 50,
-  error_geser: 10,
+  error_bound: 8,
+  error_geser: 0,
+  dither_bound: 0,
+  v_shift_bound: 8,
   repeat: 5,
 };
 
@@ -641,6 +645,17 @@ function randInt(min, maxInclusive) {
 
 function randUniform(min, max) {
   return min + randFloat() * (max - min);
+}
+
+function boundedIntegerNoise(bound) {
+  const normalizedBound = Math.max(0, Math.floor(Number(bound) || 0));
+  return normalizedBound === 0
+    ? 0
+    : randInt(-normalizedBound, normalizedBound);
+}
+
+function positiveModulo(value, modulus) {
+  return ((value % modulus) + modulus) % modulus;
 }
 
 function randNormal() {
@@ -734,8 +749,8 @@ function generateDippKeypair(params = DIPP_PARAMS) {
   );
   const kg = dippKeygenInt(aPoints, params);
   const publicKey = {
-    algorithm: "DIPP-KEM-v1 (Weiszfeld, mirip FrodoKEM)",
-    version: 1,
+    algorithm: DIPP_ALGORITHM_NAME,
+    version: DIPP_VERSION,
     dim: params.dim,
     n_pub: params.n_pub,
     coord_max: params.coord_max,
@@ -745,6 +760,8 @@ function generateDippKeypair(params = DIPP_PARAMS) {
     scale: params.scale,
     error_bound: params.error_bound,
     error_geser: params.error_geser,
+    dither_bound: params.dither_bound,
+    v_shift_bound: params.v_shift_bound,
     repeat: params.repeat,
     A_points: aPoints,
     B: kg.b,
@@ -1128,25 +1145,49 @@ function dippWrapBytes(publicKey, keyBytes) {
     scale: publicKey.scale,
     error_bound: publicKey.error_bound,
     error_geser: publicKey.error_geser,
+    // Key versi 1 tidak mempunyai dua field ini; nilai nol menjaga perilaku lama.
+    dither_bound: Number.isFinite(publicKey.dither_bound)
+      ? publicKey.dither_bound
+      : 0,
+    v_shift_bound: Number.isFinite(publicKey.v_shift_bound)
+      ? publicKey.v_shift_bound
+      : 0,
     repeat: publicKey.repeat,
   };
   const sender = dippKeygenInt(publicKey.A_points, params);
-  const fInt = Math.round(dippComputeF(publicKey.A_points, publicKey.B, sender.x, sender.w, sender.delta) * params.scale) % params.q;
+  const fInt = positiveModulo(
+    Math.round(
+      dippComputeF(
+        publicKey.A_points,
+        publicKey.B,
+        sender.x,
+        sender.w,
+        sender.delta
+      ) * params.scale
+    ) + boundedIntegerNoise(params.dither_bound),
+    params.q
+  );
   const vList = [];
   for (const bit of bytesToBits(keyBytes)) {
     for (let i = 0; i < params.repeat; i++) {
-      const err = randInt(-params.error_bound, params.error_bound);
-      vList.push((fInt + err + bit * Math.floor(params.q / 2) + params.q) % params.q);
+      const error = boundedIntegerNoise(params.error_bound);
+      const vShift = boundedIntegerNoise(params.v_shift_bound);
+      vList.push(positiveModulo(
+        fInt + error + vShift + bit * Math.floor(params.q / 2),
+        params.q
+      ));
     }
   }
   return {
-    algorithm: "DIPP-KEM-v1 (Weiszfeld, mirip FrodoKEM)",
-    version: 1,
+    algorithm: publicKey.algorithm || DIPP_ALGORITHM_NAME,
+    version: publicKey.version || DIPP_VERSION,
     created: new Date().toISOString(),
     n_bits: keyBytes.length * 8,
     repeat: params.repeat,
     q: params.q,
     scale: params.scale,
+    dither_bound: params.dither_bound,
+    v_shift_bound: params.v_shift_bound,
     B_s: sender.b,
     V: vList,
   };

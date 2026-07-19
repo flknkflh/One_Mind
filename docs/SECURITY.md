@@ -1,6 +1,6 @@
 # Keamanan ONE_MIND
 
-Dokumen ini menjelaskan perilaku kode aktual per 19 Juli 2026, bukan target desain lama.
+Dokumen ini menjelaskan perilaku kode aktual per 20 Juli 2026, bukan target desain lama.
 
 ## Model Keamanan
 
@@ -96,6 +96,20 @@ GCM memberi kerahasiaan dan integritas jika nonce tidak digunakan ulang dengan k
 ## Status DIPP-KEM
 
 DIPP-KEM pada repository adalah algoritma custom/prototipe berbasis implementasi referensi proyek. Algoritma ini belum memiliki jaminan keamanan seperti ML-KEM atau skema standar yang melalui standardisasi dan audit luas. Jangan membuat klaim “military-grade”, post-quantum, atau setara FrodoKEM tanpa analisis kriptografi independen.
+
+Identitas baru memakai format `DIPP-KEM-v2` dengan parameter aktif:
+
+- `n_pub=20`, `dim=3`, `coord_max=1000`;
+- `delta_range=[-0.1, 0.1]`, `w_range=[0.01, 0.15]`;
+- `q=4096`, `scale=100`, `repeat=5`;
+- `error_geser=0`, `dither_bound=0`, `error_bound=8`, `v_shift_bound=8`.
+
+`dither_bound` diterapkan sebagai noise integer pada hasil kuantisasi nilai bersama dan
+`v_shift_bound` diterapkan sebagai pergeseran acak tambahan pada setiap nilai
+`V`. Public key versi 1 yang tidak memuat kedua field tersebut menggunakan
+fallback nol sehingga tetap dapat dipakai untuk wrap/unwrap lama. Mengganti
+default tidak mengubah identitas DIPP yang sudah pernah diekspor; hanya
+identitas yang dibuat sesudah perubahan ini yang memakai parameter v2.
 
 ## Otorisasi File
 

@@ -1,6 +1,6 @@
 # Manual Sistem ONE_MIND
 
-Versi dokumentasi: 19 Juli 2026
+Versi dokumentasi: 20 Juli 2026
 Dasar dokumentasi: perilaku kode pada `app/main.py`, `static/app.js`, konfigurasi Docker, dan skema SQLite aktual.
 
 ## 1. Ringkasan
@@ -155,6 +155,13 @@ Implementasi aktual mengekspor private key tanpa enkripsi password:
 
 - file DIPP memuat `public_key` dan `private_key` dalam JSON;
 - file RSA memuat public key PEM dan private key PKCS#8 base64.
+
+Identitas DIPP baru memakai format v2 dengan profil parameter hasil optimasi:
+`n_pub=20`, `dim=3`, `coord_max=1000`, `delta_range=[-0.1,0.1]`,
+`q=4096`, `scale=100`, `error_geser=0`, `dither_bound=0`,
+`error_bound=8`, dan `v_shift_bound=8`. Nilai `w_range=[0.01,0.15]` dan
+`repeat=5` tetap digunakan. Identitas v1 lama tetap dapat diimpor dan dipakai;
+profil baru hanya berlaku pada identitas yang dibuat setelah perubahan ini.
 
 Simpan kedua file di media terenkripsi dan terkontrol. Kehilangan DIPP key dapat membuat file lama tidak dapat dibuka. Pencurian key bersama kredensial terkait dapat memungkinkan penyalahgunaan akun/data.
 
