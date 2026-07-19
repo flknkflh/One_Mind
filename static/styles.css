@@ -857,8 +857,55 @@ code {
   box-shadow: 0 22px 55px rgba(6, 45, 46, 0.3);
   font-size: 13px;
   line-height: 1.5;
+  white-space: pre-line;
   backdrop-filter: blur(14px);
   animation: noticeIn 220ms ease-out;
+}
+
+.notice.noticeError {
+  border-color: rgba(255, 154, 154, 0.35);
+  color: #fff2f2;
+  background: linear-gradient(135deg, rgba(91, 20, 27, 0.98), rgba(139, 31, 42, 0.98));
+}
+
+.notice.noticeWarning {
+  border-color: var(--warning-line);
+  color: var(--warning-ink);
+  background: linear-gradient(135deg, #503b14, #72551c);
+}
+
+.notice.noticeInfo {
+  border-color: #416b91;
+  color: #e9f5ff;
+  background: linear-gradient(135deg, #16344f, #1f5278);
+}
+
+.formFeedback {
+  margin: 2px 0 4px;
+  border: 1px solid;
+  border-radius: var(--radius-sm);
+  padding: 11px 13px;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.5;
+  white-space: pre-line;
+}
+
+.formFeedbackError {
+  border-color: rgba(255, 137, 137, 0.42);
+  color: #ffdada;
+  background: rgba(105, 24, 32, 0.62);
+}
+
+.formFeedbackInfo {
+  border-color: #416b91;
+  color: #dcefff;
+  background: rgba(22, 52, 79, 0.62);
+}
+
+form[aria-busy="true"] button[type="submit"] {
+  cursor: wait;
+  opacity: 0.68;
 }
 
 @keyframes noticeIn {

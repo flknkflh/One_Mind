@@ -83,17 +83,296 @@ const CHUNK_PROFILES = [
 
 function $(id) { return document.getElementById(id); }
 
+const UI_ERROR_CONTEXT = {
+  registerForm: "register",
+  loginForm: "login",
+  adminSetupForm: "adminSetup",
+  adminLoginForm: "adminLogin",
+  adminPasswordForm: "changePassword",
+  adminAccountGroups: "adminAction",
+  refreshAdminBtn: "refresh",
+  uploadForm: "upload",
+  shareForm: "share",
+  fileList: "file",
+  refreshFilesBtn: "refresh",
+  userList: "fileRequest",
+  incomingRequestList: "fileRequest",
+  refreshRequestsBtn: "refresh",
+  loadAccessBtn: "access",
+  rotateKeyBtn: "rotate",
+  accessList: "revoke",
+  updateFileInput: "update",
+  importRsaInput: "keyImport",
+  importDippInput: "keyImport",
+  exportRsaBtn: "keyExport",
+};
+
 function on(id, event, handler) {
   const el = $(id);
-  if (el) el.addEventListener(event, handler);
+  if (!el) return;
+  el.addEventListener(event, evt => {
+    const form = el instanceof HTMLFormElement
+      ? el
+      : evt.target?.closest?.("form") || null;
+    const isSubmit = event === "submit" && form;
+    if (isSubmit) {
+      clearFormFeedback(form);
+      setFormBusy(form, true);
+    }
+
+    let result;
+    try {
+      result = handler(evt);
+    } catch (error) {
+      handleUiError(error, {context: UI_ERROR_CONTEXT[id], form});
+      if (isSubmit) setFormBusy(form, false);
+      return;
+    }
+
+    if (result && typeof result.then === "function") {
+      result
+        .catch(error => handleUiError(
+          error,
+          {context: UI_ERROR_CONTEXT[id], form}
+        ))
+        .finally(() => {
+          if (isSubmit) setFormBusy(form, false);
+        });
+    } else if (isSubmit) {
+      setFormBusy(form, false);
+    }
+  });
 }
 
-function showNotice(message) {
+let noticeTimer = null;
+
+function showNotice(message, type = "success", duration = 4200) {
   const notice = $("notice");
   if (!notice) return;
   notice.textContent = message;
+  notice.classList.remove("noticeError", "noticeWarning", "noticeInfo");
+  if (type === "error") notice.classList.add("noticeError");
+  if (type === "warning") notice.classList.add("noticeWarning");
+  if (type === "info") notice.classList.add("noticeInfo");
+  notice.setAttribute("role", type === "error" ? "alert" : "status");
+  notice.setAttribute("aria-live", type === "error" ? "assertive" : "polite");
   notice.classList.remove("hidden");
-  setTimeout(() => notice.classList.add("hidden"), 4200);
+  if (noticeTimer) clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => notice.classList.add("hidden"), duration);
+}
+
+function setFormBusy(form, busy) {
+  if (!form) return;
+  form.toggleAttribute("aria-busy", busy);
+  form.querySelectorAll('button[type="submit"]').forEach(button => {
+    button.disabled = busy;
+  });
+}
+
+function clearFormFeedback(form) {
+  form?.querySelector(".formFeedback")?.remove();
+}
+
+function showFormFeedback(form, message, type = "error") {
+  if (!form) return;
+  clearFormFeedback(form);
+  const feedback = document.createElement("div");
+  feedback.className = `formFeedback ${type === "error" ? "formFeedbackError" : "formFeedbackInfo"}`;
+  feedback.setAttribute("role", type === "error" ? "alert" : "status");
+  feedback.textContent = message;
+  const submitButton = form.querySelector('button[type="submit"]');
+  form.insertBefore(feedback, submitButton || null);
+  feedback.scrollIntoView({block: "nearest", behavior: "smooth"});
+}
+
+class ApiError extends Error {
+  constructor(status, detail, path) {
+    super(typeof detail === "string" ? detail : `Request gagal (${status}).`);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+    this.path = path;
+  }
+}
+
+function apiErrorFromResponse(response, data, path) {
+  return new ApiError(response.status, data?.detail, path);
+}
+
+function fieldLabel(field) {
+  return ({
+    username: "Username",
+    password: "Password",
+    current_password: "Password saat ini",
+    new_password: "Password baru",
+    display_name: "Nama lengkap",
+    nip: "NIP",
+    rank: "Pangkat",
+    position: "Jabatan",
+    filename: "Nama file",
+    recipient: "Penerima",
+  })[field] || String(field || "Input").replaceAll("_", " ");
+}
+
+function validationMessage(detail) {
+  if (!Array.isArray(detail) || !detail.length) return null;
+  const issue = detail[0] || {};
+  const field = Array.isArray(issue.loc) ? issue.loc.at(-1) : "Input";
+  const label = fieldLabel(field);
+  const type = String(issue.type || "");
+  if (type.includes("missing")) return `${label} wajib diisi.`;
+  if (type.includes("too_short")) {
+    const minimum = issue.ctx?.min_length;
+    return minimum
+      ? `${label} minimal ${minimum} karakter.`
+      : `${label} terlalu pendek.`;
+  }
+  if (type.includes("too_long")) {
+    const maximum = issue.ctx?.max_length;
+    return maximum
+      ? `${label} maksimal ${maximum} karakter.`
+      : `${label} terlalu panjang.`;
+  }
+  if (type.includes("greater_than")) return `${label} harus lebih dari nol.`;
+  const backendMessage = String(issue.msg || "")
+    .replace(/^value error,\s*/i, "")
+    .trim();
+  if (backendMessage && !/^input should|^field required/i.test(backendMessage)) {
+    return backendMessage;
+  }
+  return `${label} tidak valid. Periksa kembali nilai yang dimasukkan.`;
+}
+
+const STATUS_ERROR_MESSAGE = {
+  400: "Permintaan tidak valid. Periksa kembali data yang dimasukkan.",
+  401: "Autentikasi gagal atau sesi sudah berakhir. Silakan login kembali.",
+  403: "Anda tidak memiliki izin untuk melakukan tindakan ini.",
+  404: "Data yang diminta tidak ditemukan atau sudah tidak tersedia.",
+  409: "Tindakan tidak dapat dilanjutkan karena data sudah berubah atau sudah diproses.",
+  413: "Data atau file terlalu besar untuk dikirim.",
+  416: "Bagian file yang diminta berada di luar rentang.",
+  422: "Data belum lengkap atau format input tidak valid.",
+  429: "Terlalu banyak percobaan. Tunggu beberapa menit lalu coba kembali.",
+};
+
+const CONTEXT_ERROR_MESSAGE = {
+  register: "Registrasi gagal. Periksa data akun lalu coba kembali.",
+  login: "Login gagal. Periksa username, password, Identitas DIPP, dan RSA Login Key.",
+  adminSetup: "Inisialisasi administrator gagal.",
+  adminLogin: "Login administrator gagal. Periksa username dan password.",
+  changePassword: "Password belum berhasil diubah. Periksa password saat ini dan password baru.",
+  upload: "Upload gagal. File Anda tidak disimpan sebagai file aktif.",
+  download: "Download atau dekripsi gagal. Periksa akses dan Identitas DIPP Anda.",
+  share: "File belum berhasil dibagikan. Periksa penerima dan kunci yang digunakan.",
+  fileRequest: "Permintaan file belum berhasil diproses.",
+  access: "Daftar akses belum berhasil dimuat.",
+  revoke: "Akses belum berhasil dicabut.",
+  rotate: "Rotasi kunci belum berhasil diselesaikan.",
+  update: "Update file belum berhasil diselesaikan.",
+  keyImport: "File key tidak dapat dimuat. Pastikan file benar dan sesuai dengan akun.",
+  keyExport: "File key belum berhasil diekspor.",
+  file: "Tindakan pada file belum berhasil diselesaikan.",
+  adminAction: "Tindakan administrator belum berhasil diselesaikan.",
+  refresh: "Data belum berhasil dimuat ulang. Periksa koneksi lalu coba kembali.",
+};
+
+function humanizeServerDetail(detail, context) {
+  const message = String(detail || "").trim();
+  if (!message) return null;
+  if (
+    context === "upload"
+    && /total_chunks|chunk_index|upload session|folder upload|ukuran chunk|base64 chunk/i.test(message)
+  ) {
+    return "Upload terputus atau salah satu bagian file tidak konsisten. Pilih file dan ulangi upload.";
+  }
+  if (/integrity check gagal/i.test(message)) {
+    return "Pemeriksaan integritas upload gagal. Ciphertext yang diterima server tidak sama dengan hasil enkripsi browser.";
+  }
+  if (/wrapped key harus dibuat ulang/i.test(message)) {
+    return "Daftar akses berubah saat file diproses. Muat ulang data lalu ulangi update atau rotasi kunci.";
+  }
+  if (/ciphertext update|metadata chunk|format penyimpanan file/i.test(message)) {
+    return CONTEXT_ERROR_MESSAGE[context]
+      || "Format file terenkripsi tidak dapat diproses.";
+  }
+  if (/RSA Public Key user belum tersedia|PKI Public Key belum tersedia/i.test(message)) {
+    return "RSA Login Key akun belum terdaftar. Hubungi administrator atau lakukan registrasi ulang sesuai prosedur.";
+  }
+  if (/Proof of Possession RSA tidak valid/i.test(message)) {
+    return "Tanda tangan RSA Login Key tidak valid. Pastikan key tersebut milik akun yang sedang login.";
+  }
+  return message;
+}
+
+function humanizeError(error, context) {
+  if (error instanceof ApiError) {
+    if (error.status >= 500) {
+      return "Server mengalami gangguan saat memproses permintaan. Periksa status terbaru sebelum mencoba kembali.";
+    }
+    const validation = validationMessage(error.detail);
+    if (validation) return validation;
+    if (typeof error.detail === "string" && error.detail.trim()) {
+      return humanizeServerDetail(error.detail, context);
+    }
+    return STATUS_ERROR_MESSAGE[error.status]
+      || CONTEXT_ERROR_MESSAGE[context]
+      || "Permintaan belum berhasil diproses.";
+  }
+
+  const name = String(error?.name || "");
+  const message = String(error?.message || "").trim();
+  if (
+    name === "TypeError"
+    && /fetch|network|load failed|connection/i.test(message)
+  ) {
+    return "Tidak dapat terhubung ke server. Periksa jaringan dan koneksi HTTPS, lalu coba kembali.";
+  }
+  if (name === "OperationError") {
+    return context === "download" || context === "rotate" || context === "update"
+      ? "Dekripsi gagal. Key tidak cocok, akses sudah berubah, atau ciphertext tidak valid."
+      : "Operasi kriptografi gagal. Pastikan file key benar dan sesuai dengan akun.";
+  }
+  if (name === "DataError" || name === "InvalidCharacterError" || name === "SyntaxError") {
+    return CONTEXT_ERROR_MESSAGE[context]
+      || "Format data atau file key tidak valid.";
+  }
+  if (name === "QuotaExceededError" || error instanceof RangeError) {
+    return "File terlalu besar untuk diproses di memori browser pada perangkat ini.";
+  }
+  if (name === "NotAllowedError") {
+    return "Operasi dibatalkan atau tidak diizinkan oleh browser.";
+  }
+  if (/PKI Private Key|RSA Login Private Key/i.test(message)) {
+    return "RSA Login Key belum dimuat. Pilih file RSA Login Key yang sesuai dengan akun.";
+  }
+  if (/Jumlah bit DIPP|Paket kunci DIPP/i.test(message)) {
+    return "Data DIPP atau wrapped key tidak konsisten dan tidak dapat digunakan.";
+  }
+  if (/Metadata download chunk/i.test(message)) {
+    return "Informasi download file tidak valid. Muat ulang daftar file lalu coba kembali.";
+  }
+  if (/SHA-256 ciphertext hasil download tidak cocok/i.test(message)) {
+    return "Pemeriksaan integritas gagal. Data hasil download tidak sama dengan file yang tersimpan.";
+  }
+  if (/Chunk \d+ tidak konsisten|Ukuran ciphertext hasil download/i.test(message)) {
+    return "Salah satu bagian file tidak lengkap atau tidak konsisten. Silakan ulangi download.";
+  }
+  if (/ciphertext harus berupa Uint8Array|chunkSize tidak valid/i.test(message)) {
+    return CONTEXT_ERROR_MESSAGE[context]
+      || "File tidak dapat diproses oleh browser.";
+  }
+  if (message && !/^HTTP\s+\d+/i.test(message)) return message;
+  return CONTEXT_ERROR_MESSAGE[context] || "Terjadi kesalahan. Silakan coba kembali.";
+}
+
+function handleUiError(error, {context = "generic", form = null} = {}) {
+  console.error(`[UI:${context}]`, error);
+  const message = humanizeError(error, context);
+  if (form) {
+    showFormFeedback(form, message, "error");
+  } else {
+    showNotice(message, "error", 7000);
+  }
 }
 
 function escapeHtml(value) {
@@ -243,20 +522,11 @@ async function api(path, options = {}) {
 
     if (!res.ok) {
 
-        console.error("HTTP ERROR", res.status);
+      console.error("HTTP ERROR", res.status);
 
-        console.error(data);
+      console.error(data);
 
-        throw new Error(
-            "HTTP " +
-            res.status +
-            "\n\n" +
-            JSON.stringify(
-                data,
-                null,
-                2
-            )
-        );
+      throw apiErrorFromResponse(res, data, path);
 
     }
 
@@ -272,11 +542,7 @@ async function apiBinary(path) {
   const response = await fetch(path, {headers});
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    const error = new Error(
-      `HTTP ${response.status}\n\n${JSON.stringify(data, null, 2)}`
-    );
-    error.status = response.status;
-    throw error;
+    throw apiErrorFromResponse(response, data, path);
   }
   return {
     bytes: new Uint8Array(await response.arrayBuffer()),
@@ -303,12 +569,7 @@ async function pendingLoginApi(
     const data = await res.json().catch(() => ({}));
 
     if (!res.ok) {
-        throw new Error(
-            "HTTP " +
-            res.status +
-            "\n\n" +
-            JSON.stringify(data, null, 2)
-        );
+        throw apiErrorFromResponse(res, data, path);
     }
 
     return data;
@@ -343,16 +604,7 @@ async function adminApi(path, options = {}) {
             refreshAdminSetupStatus();
         }
 
-        throw new Error(
-            "HTTP " +
-            res.status +
-            "\n\n" +
-            JSON.stringify(
-                data,
-                null,
-                2
-            )
-        );
+        throw apiErrorFromResponse(res, data, path);
     }
 
     return data;
@@ -2786,7 +3038,7 @@ on(
         }
         catch (err) {
             console.error(err);
-            showNotice(err.message);
+            handleUiError(err, {context: "keyImport"});
         }
 
         input.value = "";
@@ -2818,7 +3070,7 @@ on("importDippInput", "change", async (evt) => {
 
         console.error(err);
 
-        showNotice(err.message);
+        handleUiError(err, {context: "keyImport"});
 
     }
 
@@ -2836,8 +3088,10 @@ on("loginForm", "submit", async (evt) => {
     const password = form.get("password");
 
     if (!selectedDippFile) {
-        showNotice(
-            "Silakan pilih file Identitas DIPP terlebih dahulu."
+        showFormFeedback(
+            formElement,
+            "Silakan pilih file Identitas DIPP terlebih dahulu.",
+            "error"
         );
         return;
     }
@@ -2936,10 +3190,7 @@ on("loginForm", "submit", async (evt) => {
         renderAuth();
         updateLocalKeyStatus();
 
-        showNotice(
-            err.message ||
-            "Login dibatalkan karena DIPP atau RSA Login Key tidak valid."
-        );
+        handleUiError(err, {context: "login", form: formElement});
     }
 
 });
@@ -3017,7 +3268,7 @@ on("uploadForm", "submit", async (evt) => {
 
         console.error(err);
 
-        alert(err.message || err);
+        handleUiError(err, {context: "upload", form});
 
     }
     finally {
@@ -3099,7 +3350,7 @@ on("fileList", "click", async (evt) => {
     URL.revokeObjectURL(url);
     showNotice("Download dan dekripsi file selesai.");
   } catch (err) {
-    alert(err.message || err);
+    handleUiError(err, {context: "download"});
   } finally {
     clearDownloadProgress();
   }
@@ -3128,7 +3379,7 @@ on("userList", "click", async (evt) => {
       await refreshAll();
       showNotice("Permintaan file dikirim kepada pemilik.");
     } catch (err) {
-      alert(err.message || err);
+      handleUiError(err, {context: "fileRequest"});
     }
     return;
   }
@@ -3172,13 +3423,13 @@ on("incomingRequestList", "click", async (evt) => {
     await refreshAll();
     showNotice("Permintaan file ditolak.");
   } catch (err) {
-    alert(err.message || err);
+    handleUiError(err, {context: "fileRequest"});
   }
 });
 on("loadAccessBtn", "click", async () => {
   const fileId = document.querySelector("#shareForm select[name=file_id]")?.value;
   if (!fileId) {
-    showNotice("Pilih file dulu.");
+    showNotice("Pilih file terlebih dahulu.", "warning");
     return;
   }
   await renderAccess(fileId);
@@ -3186,13 +3437,13 @@ on("loadAccessBtn", "click", async () => {
 on("rotateKeyBtn", "click", async () => {
   const fileId = document.querySelector("#shareForm select[name=file_id]")?.value;
   if (!fileId) {
-    showNotice("Pilih file dulu.");
+    showNotice("Pilih file terlebih dahulu.", "warning");
     return;
   }
   try {
     await rotateCurrentFileKey(fileId);
   } catch (err) {
-    alert(err.message || err);
+    handleUiError(err, {context: "rotate"});
   } finally {
     clearDownloadProgress();
   }
@@ -3275,9 +3526,7 @@ on(
 
             console.error(err);
 
-            showNotice(
-                err.message
-            );
+            handleUiError(err, {context: "keyExport"});
 
         }
 
@@ -3322,7 +3571,14 @@ on("logoutBtn", "click", () => {
 
 });
 
-window.addEventListener("unhandledrejection", evt => showNotice(evt.reason?.message || "Terjadi kesalahan."));
+window.addEventListener("unhandledrejection", evt => {
+  evt.preventDefault();
+  handleUiError(evt.reason);
+});
+document.addEventListener("input", evt => {
+  const form = evt.target?.closest?.("form");
+  if (form) clearFormFeedback(form);
+});
 renderAuth();
 refreshAll();
 refreshAdminSetupStatus();
