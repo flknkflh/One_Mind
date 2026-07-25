@@ -1,16 +1,21 @@
+name: one-mind-dipp
+
 services:
   one-mind:
     build: .
-    container_name: one_mind
+    container_name: one_mind_dipp
     ports:
-      - "8443:8443"
+      - "8444:8443"
     environment:
       ONE_MIND_DATA_DIR: /app/data
       ONE_MIND_HOST: 0.0.0.0
       ONE_MIND_PORT: 8443
       ONE_MIND_TLS_MODE: internal
+      ONE_MIND_CRYPTO_PROFILE: ONE_MIND_DIPP_EPHEMERAL_R_WEIGHTED_V2
       ONE_MIND_ALLOWED_HOSTS: ${ONE_MIND_ALLOWED_HOSTS:-*}
-      ONE_MIND_SESSION_SECONDS: ${ONE_MIND_SESSION_SECONDS:-43200}
+      ONE_MIND_SESSION_SECONDS: ${ONE_MIND_SESSION_SECONDS:-300}
+      ONE_MIND_ADMIN_SESSION_SECONDS: ${ONE_MIND_ADMIN_SESSION_SECONDS:-300}
+      ONE_MIND_PENDING_LOGIN_SECONDS: ${ONE_MIND_PENDING_LOGIN_SECONDS:-300}
       ONE_MIND_LOGIN_MAX_FAILURES: ${ONE_MIND_LOGIN_MAX_FAILURES:-8}
       ONE_MIND_LOGIN_WINDOW_SECONDS: ${ONE_MIND_LOGIN_WINDOW_SECONDS:-600}
       ONE_MIND_ARGON2_TIME_COST: ${ONE_MIND_ARGON2_TIME_COST:-3}
@@ -19,5 +24,11 @@ services:
     volumes:
       - ./data:/app/data
       - ./certs:/app/certs
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --show-error --insecure https://127.0.0.1:8443/health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 

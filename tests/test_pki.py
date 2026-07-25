@@ -21,6 +21,7 @@ class PKIRotationTests(unittest.TestCase):
         self.conn = main.db()
         self.conn.execute("DELETE FROM certificate_challenges")
         self.conn.execute("DELETE FROM certificates")
+        self.conn.execute("DELETE FROM dipp_ciphertexts")
         self.conn.execute("DELETE FROM users")
         self.conn.execute("DELETE FROM system_metadata")
         self.conn.commit()

@@ -1,178 +1,78 @@
-# ONE_MIND
+# ONE_MIND DIPP Ephemeral-R
 
-ONE_MIND adalah prototipe web drive terenkripsi. Isi file dienkripsi dan didekripsi di browser, sedangkan server menyimpan ciphertext, metadata, public key, wrapped file key, status akun, dan sertifikat pengguna.
+ONE_MIND DIPP adalah varian penelitian ONE_MIND yang terisolasi dari repo FrodoKEM. Versi ini menerapkan **DIPP Ephemeral-R weighted v2**: setiap akun mempunyai titik privat Bob statis untuk menerima file, sedangkan pengirim membuat 256 titik `R_i` sekali pakai untuk setiap wrapped file key. Isi file tetap dienkripsi di browser dengan AES-256-GCM.
 
-Dokumentasi:
+Implementasi mengikuti [spesifikasi integrasi Ephemeral-R](docs/DIPP_EPHEMERAL_R_SPEC_FOR_ONE_MIND.md) dalam mode **standalone pre-key + HKDF**. Tidak ada ECDH atau combiner hybrid. RSA digunakan untuk menandatangani transcript, bukan untuk membentuk shared key.
 
-- [Manual sistem](docs/MANUAL_BOOK.md)
-- [Catatan keamanan](docs/SECURITY.md)
-- [Panduan TLS dan deployment](docs/TLS_MIGRATION.md)
-- [Deployment khusus jaringan kantor](docs/OFFICE_DEPLOYMENT.md)
-- [Audit riwayat remote](docs/REMOTE_HISTORY_AUDIT.md)
-- [Konteks implementasi](Prompt.md)
-
-## Menjalankan Test
-
-Test autentikasi dan PKI berada pada Docker build stage terpisah sehingga tidak
-ikut masuk image produksi:
-
-```bash
-docker build --target test -t one-mind-tests .
-docker run --rm -e ONE_MIND_DATA_DIR=/tmp/one-mind-tests one-mind-tests
-node tests/test_dipp_parameters.js
+```text
+preKey -> 256 komponen DIPP -> HKDF(transcript) -> K_DIPP
+K_DIPP -> AES-256-GCM wrap -> K_AES
 ```
 
-Suite ini memverifikasi baseline password, integritas token, RSA
-proof-of-possession, validasi issuer/signature certificate, deteksi rotasi CA,
-penerbitan ulang certificate setelah RSA proof yang valid, serta penyimpanan,
-otorisasi, integritas, update, dan download ciphertext per chunk.
-Test Node terpisah memverifikasi parameter DIPP v2, reliabilitas wrap–unwrap,
-dan kompatibilitas public key DIPP v1.
+## Isolasi Compose
 
-> Status dokumentasi: diselaraskan dengan kode repository pada 20 Juli 2026. Implementasi saat ini berbeda dari rancangan lama yang menyimpan private key terenkripsi di `localStorage`.
+- project Compose: `one-mind-dipp`;
+- container: `one_mind_dipp`;
+- host HTTPS: `8444` (container `8443`);
+- database/runtime: `./data` repo DIPP;
+- TLS: `./certs` repo DIPP.
 
-## Menjalankan Secara Lokal
+Versi Frodo tetap dapat berjalan sebagai project lain pada container `one_mind` dan port `8443`. Port berbeda juga memisahkan origin, token, dan `localStorage` browser.
 
-Persyaratan: Docker dan Docker Compose.
+## Menjalankan
 
-```bash
-docker compose up --build
+```powershell
+cd "C:\Users\LENOVO\Documents\PELATIHAN_SIBER_3_MINGGU\.AAA_One_Mind_DIPP"
+docker compose up -d --build
+docker compose ps
 ```
 
-Buka `https://localhost:8443`. Mode lokal memakai sertifikat self-signed sehingga browser dapat menampilkan peringatan.
+Akses lokal di `https://localhost:8444` atau jaringan di `https://IP-SERVER:8444`. Healthcheck yang benar melaporkan `ONE_MIND_DIPP_EPHEMERAL_R_WEIGHTED_V2` dan container `healthy`.
 
-Data lokal dipasang dari:
+## Implementasi Ephemeral-R
 
-- `./data` ke `/app/data`
-- `./certs` ke `/app/certs`
+Saat registrasi browser membuat:
 
-Konfigurasi utama tersedia melalui `ONE_MIND_ALLOWED_HOSTS`, `ONE_MIND_SESSION_SECONDS`, `ONE_MIND_LOGIN_MAX_FAILURES`, dan `ONE_MIND_LOGIN_WINDOW_SECONDS`.
+- `seed_A`, public cloud deterministik berukuran `n=16`, dan profil `d=64`;
+- titik privat penerima `x_B` serta public transform `B_B`;
+- RSA 4096-bit untuk login dan signature transcript;
+- vault `.dipp` v8 terenkripsi PBKDF2-SHA-256 600.000 iterasi + AES-256-GCM;
+- setiap titik rahasia berbobot 8 dan radiusnya dipilih uniform pada rentang `2S_pub–4S_pub`;
+- noise geometrik vector dinonaktifkan pada profil correctness weighted v2; noise modular `e_i ∈ [-64,64]` tetap digunakan.
 
-## Alur Sistem Saat Ini
+Untuk setiap pembungkusan, browser membuat pre-key acak 256-bit. Setiap bit memakai `R_i` fresh dan menghasilkan satu `(U_i,V_i)`; `R_i` serta state geometrik sementara kemudian dibersihkan. Pengirim dan penerima menurunkan `K_DIPP` dengan HKDF-SHA-256 menggunakan hash transcript sebagai salt. `K_DIPP` membungkus AES file key memakai AES-256-GCM dengan nonce 12-byte dan AAD terikat transcript.
 
-### 1. Inisialisasi administrator
+Tidak ada relay atau syarat peer online. Server hanya menyimpan:
 
-Administrator pertama dibuat melalui UI/API setup. Sesudah itu administrator dapat login, menyetujui atau menolak registrasi, mencabut/memulihkan akun, mengubah data akun, melakukan soft-delete, dan mengganti password admin.
+- public identity dan RSA public key;
+- ciphertext file serta wrapped key;
+- metadata replay minimal pada `dipp_ciphertexts` (`session_id`, identitas, key ID, hash transcript, file context, waktu).
 
-### 2. Registrasi pengguna
+Server memvalidasi schema canonical, parameter, ukuran/dimensi/domain koordinat, `V_i` dalam `Z_q`, komponen duplikat, binding public key penerima, signature pengirim, wrap nonce/ciphertext, dan reuse session/transcript. `x_B`, `R_i`, pre-key, `K_DIPP`, dan plaintext file key tidak disimpan server.
 
-Browser membuat dua identitas:
+Format ACGR, relay session, DIPP-KEM lama, serta vault sebelum v8 tidak kompatibel dan ditolak.
 
-- keypair DIPP untuk membungkus AES file key;
-- keypair RSA 4096-bit untuk proof-of-possession saat login.
+## Test
 
-Server menerima data identitas, DIPP public key, RSA public key, serta password melalui HTTPS. Password baru disimpan sebagai hash Argon2id. Hash PBKDF2-SHA-256 lama tetap dapat diverifikasi dan otomatis diganti Argon2id setelah login yang valid. Akun baru berstatus `PENDING` sampai diproses administrator.
+```powershell
+docker build --target test -t one-mind-dipp-tests .
+docker run --rm -e ONE_MIND_DATA_DIR=/tmp/one-mind-dipp-tests one-mind-dipp-tests
+node tests/test_dipp_ephemeral_r.js
+```
 
-Browser mengekspor dua file identitas pengguna. Pada implementasi saat ini, private key di dalam file tersebut **belum dienkripsi dengan password**. File harus diperlakukan sebagai secret berisiko tinggi.
+Test JavaScript mencakup SHAKE-256 FIPS 202, public-cloud deterministik, pre-key encapsulation/decapsulation, transcript-bound HKDF, AES-GCM key wrapping, vault, freshness, signature, dan tamper rejection. Test Python mencakup autentikasi transcript, public-material substitution, replay, larangan kolom secret, auth/PKI, chunk ciphertext, serta otorisasi file.
 
-### 3. Login
+## Data dan database
 
-Login memiliki dua tahap:
+Runtime berada di `data/`. Database Frodo atau ACGR tidak boleh dipakai karena public identity dan wrapped key tidak kompatibel. Saat skema ini dimulai, tabel relay ACGR `dipp_sessions` dihapus dan diganti registry replay `dipp_ciphertexts`; data file DIPP lama harus dianggap tidak dapat dibuka dengan vault Ephemeral-R.
 
-1. Server memeriksa username, password, dan status akun lalu memberikan pending-login token.
-2. Browser mengimpor RSA Login Key, meminta nonce, menandatangani nonce, dan server memverifikasi signature dengan RSA public key pengguna.
+## Batas keamanan
 
-Setelah verifikasi berhasil, server menerbitkan bearer token utama. Saat login pertama yang valid, certificate pengguna diterbitkan otomatis jika belum ada.
-
-Bearer token dan username disimpan di `localStorage`. DIPP/RSA private key tidak disimpan di `localStorage`; key yang diimpor hidup di RAM tab.
-
-### 4. Upload
-
-Browser:
-
-1. membuat AES-256-GCM key acak;
-2. mengenkripsi file;
-3. menghitung SHA-256 ciphertext;
-4. membungkus raw AES key untuk pemilik menggunakan DIPP public key;
-5. mengirim ciphertext dalam beberapa chunk sesuai ukuran file;
-6. menyelesaikan upload dengan envelope, hash, dan wrapped key pemilik.
-
-Server memverifikasi ukuran setiap chunk serta SHA-256 seluruh ciphertext secara
-incremental. Chunk yang lolos disimpan permanen sebagai file biner terpisah;
-envelope JSON hanya memuat metadata enkripsi dan deskriptor download, bukan
-`ciphertext_b64`.
-
-Saat upload, owner memilih file disembunyikan atau ditampilkan pada katalog internal. File lama dan pilihan default tetap tersembunyi. Katalog hanya menampilkan metadata; ciphertext dan key tidak diberikan kepada user yang belum mempunyai akses.
-
-### 5. Download dan berbagi
-
-Server hanya mengembalikan metadata dan chunk kepada akun yang memiliki record
-akses. Browser mengambil chunk secara berurutan (maksimal tiga percobaan per
-chunk), memverifikasi ukuran dan SHA-256 ciphertext, membuka wrapped key memakai
-DIPP private key di RAM, lalu mendekripsi ciphertext.
-
-Download tidak lagi meminta satu envelope JSON besar. Namun implementasi
-AES-GCM saat ini masih merakit seluruh ciphertext di RAM browser sebelum
-dekripsi, sehingga kebutuhan RAM untuk file sangat besar belum hilang.
-
-Owner dapat membagikan file sebagai `viewer` atau `editor`. Owner membuka AES key secara lokal dan membungkusnya kembali untuk DIPP public key penerima. Owner dapat mencabut akses; rotasi key diperlukan untuk melindungi versi file berikutnya dari key lama yang mungkin sudah diperoleh penerima.
-
-Untuk file yang ditampilkan pada katalog, user lain dapat mengirim permintaan. Saat owner menyetujui, browser owner membuka wrapped key miliknya dan membuat wrapped key baru untuk public key peminta. Server kemudian memberikan akses `viewer`; raw AES key tetap tidak dikirim ke server.
-
-### 6. Update dan rotasi key
-
-Owner atau editor dapat mengganti isi file. Browser membuat AES key baru, mengenkripsi ulang file, dan membuat wrapped key baru untuk semua pengguna yang masih mempunyai akses.
-
-## Data di Browser
-
-Persisten di `localStorage`:
-
-- `om_token`
-- `om_username`
-- `om_admin_token`
-- `om_admin_username`
-
-Sementara di RAM tab:
-
-- DIPP private/public identity yang diimpor;
-- RSA Login private/public key yang diimpor atau dibuat;
-- AES file key selama operasi file;
-- plaintext file selama enkripsi/dekripsi;
-- password/form data selama request;
-- daftar file, envelope, ciphertext yang sedang diproses, daftar pengguna, dan metadata UI.
-
-Auto-lock private key 15 menit belum aktif dalam kode saat ini. Key di RAM dibersihkan saat logout, refresh, tab ditutup, proses browser berhenti, atau state login direset.
-
-## Data di Server
-
-Server menyimpan:
-
-- SQLite database pengguna, administrator, certificate, audit admin, file, share, dan sesi upload;
-- hash password;
-- DIPP dan RSA public key;
-- chunk ciphertext biner dan envelope metadata;
-- wrapped AES key setiap penerima;
-- `server_secret.bin` untuk menandatangani token;
-- private key TLS dan private key CA pada deployment/repository saat ini.
-
-Server tidak dirancang menyimpan private key pengguna atau plaintext file. Namun operator server dapat mengubah JavaScript frontend yang dikirim ke browser; karena itu model ini belum melindungi pengguna dari server aktif yang berbahaya.
-
-## Batasan Keamanan Penting
-
-- File export DIPP dan RSA saat ini memuat private key tanpa enkripsi backup.
-- Token user/admin berada di `localStorage` dan dapat dibaca JavaScript pada origin aplikasi.
-- Private key di RAM belum memiliki timeout otomatis.
-- Password masih dikirim ke server melalui TLS; autentikasi belum memakai PAKE seperti OPAQUE/SRP.
-- DIPP-KEM adalah algoritma prototipe/custom dan belum boleh dianggap setara KEM standar yang diaudit.
-- Root CA key, intermediate CA key, TLS key, database, `server_secret.bin`, dan data runtime pernah terlacak dalam riwayat Git. Material tersebut sudah dikeluarkan dari pelacakan branch produksi, tetapi seluruh secret terkait tetap wajib dirotasi sebelum deployment.
-- Rate limit login tersimpan in-memory dan reset saat proses/container restart.
-- TLS melindungi data saat transit, bukan dari server/operator yang menyajikan JavaScript berbahaya.
-
-## Deployment Internet
-
-Gunakan `docker-compose.prod.yml` dan Caddy hanya setelah:
-
-1. menetapkan domain dan email ACME;
-2. membatasi `ONE_MIND_ALLOWED_HOSTS` ke hostname produksi;
-3. memastikan seluruh secret dan data aktif berada di runtime volume/secret storage serta membersihkan riwayat Git lama;
-4. merotasi key yang pernah masuk repository;
-5. menyiapkan firewall, backup terenkripsi, logging, monitoring, dan rate limiting persisten;
-6. memperbaiki export private key agar terenkripsi;
-7. mengaktifkan auto-lock key dan mengurangi ketergantungan pada `localStorage` untuk token;
-8. melakukan audit kriptografi dan penetration test independen.
-
-Implementasi saat ini adalah prototipe dan belum direkomendasikan untuk data produksi sensitif.
-
-## Prototype Referensi
-
-Kode referensi awal dipertahankan di `Referensi_Awal_Prototype/`. File tersebut bukan entry point aplikasi web saat ini dan tidak boleh digunakan sebagai sumber tunggal perilaku sistem.
+- Parameter `ER-DIPP-64-16-W8-v2` adalah parameter correctness eksperimen, bukan concrete security parameters.
+- Weighting memperlebar distribusi `k_A`, tetapi audit proxy publik `U_i/B_B` masih berhasil jauh di atas peluang acak; profil ini belum membuktikan confidentiality.
+- Fixed-point Weiszfeld 24 iterasi belum dilengkapi deterministic curvature certificate produksi.
+- Resistance terhadap equivalent-point recovery, prediction, multi-target, chosen-ciphertext, dan serangan kuantum masih harus dianalisis.
+- Mode standalone membuat confidentiality bergantung langsung pada asumsi DIPP yang belum tervalidasi; jangan dianggap setara KEM standar atau post-quantum production.
+- Token masih berada di `localStorage`; autentikasi password bergantung pada TLS dan belum memakai PAKE.
+- Server aktif dapat mengganti JavaScript yang disajikan ke browser.
+- Penggunaan untuk data sensitif memerlukan audit kriptografi, penetration test, monitoring, rate limit persisten, backup terenkripsi, dan prosedur rotasi/recovery key.

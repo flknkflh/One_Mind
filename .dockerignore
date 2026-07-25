@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 data/
+runtime/
+backups/
+tmp/
 certs/
 .env
 .env.*
@@ -16,3 +19,5 @@ app/pki/issued/
 app/pki/csr/
 app/pki/revoked/
 .git/
+.agents/
+reports/

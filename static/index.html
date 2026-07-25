@@ -62,35 +62,42 @@
             name="username"
             autocomplete="username"
             required
-            minlength="3">
+            minlength="3"
+            maxlength="80"
+            pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,79}"
+            title="Gunakan 3-80 karakter: huruf, angka, titik, underscore, atau tanda minus.">
         </label>
 
         <label>
           Nama Lengkap
           <input
             name="display_name"
-            required>
+            required
+            maxlength="160">
         </label>
 
         <label>
           NIP
           <input
             name="nip"
-            required>
+            required
+            maxlength="80">
         </label>
 
         <label>
           Pangkat
           <input
             name="rank"
-            required>
+            required
+            maxlength="80">
         </label>
 
         <label>
           Jabatan
           <input
             name="position"
-            required>
+            required
+            maxlength="160">
         </label>
 
         <label>
@@ -125,7 +132,10 @@
           <input
             name="username"
             autocomplete="username"
-            required>
+            required
+            minlength="3"
+            maxlength="80"
+            pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,79}">
 
         </label>
 
@@ -185,7 +195,9 @@
                 name="username"
                 autocomplete="username"
                 required
-                minlength="3">
+                minlength="3"
+                maxlength="80"
+                pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,79}">
             </label>
 
             <label>
@@ -214,7 +226,10 @@
             <input
               name="username"
               autocomplete="username"
-              required>
+              required
+              minlength="3"
+              maxlength="80"
+              pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,79}">
           </label>
 
           <label>
@@ -361,7 +376,7 @@
 
           <div class="statusCard">
             <span>Model keamanan</span>
-            <strong>Zero-knowledge file</strong>
+            <strong>DIPP Ephemeral-R Standalone + AES-256-GCM</strong>
           </div>
 
         </aside>
@@ -402,7 +417,7 @@
               </div>
               <div class="toolbar">
                 <label class="searchBox">Search
-                  <input id="fileSearch" type="search" placeholder="Cari nama file, owner, role...">
+                  <input id="fileSearch" type="search" maxlength="160" placeholder="Cari nama file, owner, role...">
                 </label>
                 <label class="filterBox">Filter
                   <select id="fileScope">
@@ -486,7 +501,7 @@
               </div>
               <div class="toolbar">
                 <label class="searchBox">Search user
-                  <input id="userSearch" type="search" placeholder="Cari nama, username...">
+                  <input id="userSearch" type="search" maxlength="160" placeholder="Cari nama, username...">
                 </label>
               </div>
               <div id="userList" class="list"></div>
@@ -523,15 +538,15 @@
               <div class="warningBox">
 
                 <strong>
-                  Private Key DIPP dan RSA Login Key tidak pernah disimpan di server maupun browser.
+                  Private DIPP, pairwise root, session key, dan RSA Login Key tidak pernah disimpan di server.
                 </strong>
 
                 <p>
-                  Kedua private key hanya berada pada file identitas milik pengguna dan RAM browser selama sesi aktif.
+                  Vault .dipp dienkripsi dengan password. Material aktif hanya dibuka di RAM; cache lokal, bila ada, tetap berupa ciphertext vault.
                 </p>
 
                 <ul>
-                  <li>ONE_MIND_DIPP (.dipp) untuk operasi kriptografi file.</li>
+                  <li>ONE_MIND_DIPP_EPHEMERAL_R_STANDALONE (.dipp) untuk kunci Bob statis, R Alice sekali pakai per bit pre-key, derivasi HKDF, dan pembungkusan AES file key.</li>
                   <li>ONE_MIND_RSA (.key) untuk challenge pada setiap login.</li>
                   <li>Certificate disimpan server sebagai status aktivasi akun setelah login pertama berhasil.</li>
                 </ul>
@@ -561,6 +576,11 @@
               </div>
 
               <div class="keyActions">
+
+                  <label class="importKeyControl">
+                      Password vault DIPP
+                      <input id="dippVaultPassword" type="password" autocomplete="current-password" maxlength="128">
+                  </label>
 
                   <button id="exportDippBtn" type="button">
 
@@ -608,6 +628,7 @@
     <section id="notice" class="notice hidden" role="status" aria-live="polite"></section>
     <input id="updateFileInput" class="hidden" type="file">
   </main>
-  <script src="/static/app.js?v=20260720-dipp-v2"></script>
+  <script src="/static/dipp_ephemeral_r.js?v=20260725-er-w8-v2"></script>
+  <script src="/static/app.js?v=20260725-er-w8-v2"></script>
 </body>
 </html>

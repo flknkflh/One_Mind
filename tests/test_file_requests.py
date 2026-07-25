@@ -1,16 +1,21 @@
 import json
+import shutil
 import unittest
 
 from fastapi import HTTPException
 
 from app import main
+from tests.dipp_helpers import b64url, make_user_material, wrapped_key
 
 
 class FileRequestTests(unittest.TestCase):
     def setUp(self):
         self.conn = main.db()
         self._clear_data()
+        self.materials = {}
         for username in ("alice", "bob", "charlie"):
+            public_identity, signing_private, signing_public_pem = make_user_material(username)
+            self.materials[username] = (public_identity, signing_private)
             self.conn.execute(
                 """
                 INSERT INTO users (
@@ -26,8 +31,8 @@ class FileRequestTests(unittest.TestCase):
                     f"NIP-{username}",
                     "TEST",
                     "TEST",
-                    json.dumps({"algorithm": "DIPP-TEST", "username": username}),
-                    "PUBLIC-KEY-PLACEHOLDER",
+                    json.dumps(public_identity),
+                    signing_public_pem,
                     main.now_iso(),
                 ),
             )
@@ -38,6 +43,7 @@ class FileRequestTests(unittest.TestCase):
         self.conn.close()
 
     def _clear_data(self):
+        self.conn.execute("DELETE FROM dipp_ciphertexts")
         self.conn.execute("DELETE FROM file_requests")
         self.conn.execute("DELETE FROM shares")
         self.conn.execute("DELETE FROM files")
@@ -48,8 +54,26 @@ class FileRequestTests(unittest.TestCase):
         self.conn.execute("DELETE FROM certificates")
         self.conn.execute("DELETE FROM users")
         self.conn.commit()
+        shutil.rmtree(main.STORAGE_DIR, ignore_errors=True)
+        main.STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    def dipp_wrapped_key(
+        self,
+        receiver: str,
+        marker: str = "test",
+        file_context_id: str | None = None,
+    ) -> dict:
+        return wrapped_key(
+            "alice",
+            receiver,
+            self.materials[receiver][0],
+            self.materials["alice"][1],
+            marker,
+            file_context_id,
+        )
 
     def insert_file(self, file_id: str, *, hidden: bool):
+        file_context_id = b64url(file_id.encode().ljust(24, b"0")[:24])
         self.conn.execute(
             """
             INSERT INTO files (
@@ -80,6 +104,11 @@ class FileRequestTests(unittest.TestCase):
             ),
         )
         self.conn.commit()
+        main.envelope_path(file_id).write_text(
+            json.dumps({"file_context_id": file_context_id}),
+            encoding="utf-8",
+        )
+        return file_context_id
 
     def test_catalog_exposes_only_visible_metadata(self):
         self.insert_file("visible-file", hidden=False)
@@ -108,13 +137,13 @@ class FileRequestTests(unittest.TestCase):
         self.assertEqual(hidden.exception.status_code, 404)
 
     def test_only_owner_can_approve_and_share_is_viewer(self):
-        self.insert_file("visible-file", hidden=False)
+        file_context_id = self.insert_file("visible-file", hidden=False)
         request_id = main.create_file_request(
             "visible-file",
             username="bob",
         )["id"]
         approval = main.FileRequestApprovalIn(
-            wrapped_key={"wrapped": "key-for-bob"},
+            wrapped_key=self.dipp_wrapped_key("bob", "bob", file_context_id),
         )
 
         with self.assertRaises(HTTPException) as unauthorized:
@@ -133,7 +162,10 @@ class FileRequestTests(unittest.TestCase):
             (request_id,),
         ).fetchone()
         self.assertEqual(share["permission"], "viewer")
-        self.assertEqual(json.loads(share["wrapped_key"])["wrapped"], "key-for-bob")
+        self.assertEqual(
+            json.loads(share["wrapped_key"])["version"],
+            main.DIPP_ENVELOPE_VERSION,
+        )
         self.assertEqual(request_row["status"], "APPROVED")
 
     def test_hiding_file_cancels_pending_requests(self):

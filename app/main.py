@@ -4,22 +4,24 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from fastapi import Depends, FastAPI, Header, HTTPException, Path as ApiPath, Request
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
 
 from app.auth.passwords import (
     PASSWORD_MAX_LENGTH,
@@ -44,8 +46,8 @@ STORAGE_DIR = DATA_DIR / "storage"
 TEMP_UPLOAD_DIR = DATA_DIR / "temp_uploads"
 SECRET_PATH = DATA_DIR / "keys" / "server_secret.bin"
 
-SESSION_SECONDS = int(os.environ.get("ONE_MIND_SESSION_SECONDS", "43200"))
-ADMIN_SESSION_SECONDS = int(os.environ.get("ONE_MIND_ADMIN_SESSION_SECONDS", "43200"))
+SESSION_SECONDS = int(os.environ.get("ONE_MIND_SESSION_SECONDS", "300"))
+ADMIN_SESSION_SECONDS = int(os.environ.get("ONE_MIND_ADMIN_SESSION_SECONDS", "300"))
 PENDING_LOGIN_SECONDS = int(os.environ.get("ONE_MIND_PENDING_LOGIN_SECONDS", "300"))
 LOGIN_WINDOW_SECONDS = int(os.environ.get("ONE_MIND_LOGIN_WINDOW_SECONDS", "600"))
 LOGIN_MAX_FAILURES = int(os.environ.get("ONE_MIND_LOGIN_MAX_FAILURES", "8"))
@@ -60,6 +62,95 @@ FAILED_LOGINS: dict[str, list[float]] = {}
 ACCOUNT_STATUSES = ("PENDING", "ACTIVE", "REJECTED", "DELETED")
 CERTIFICATE_STATUSES = ("NONE", "ISSUED", "REVOKED", "EXPIRED", "REPLACED")
 FILE_STORAGE_FORMAT = "chunked-v1"
+DIPP_PROTOCOL = "ONE_MIND_DIPP_EPHEMERAL_R_STANDALONE"
+DIPP_PROTOCOL_VERSION = 2
+DIPP_PARAMETER_SET = "ER-DIPP-64-16-W8-v2"
+DIPP_ENVELOPE_VERSION = "ONE_MIND-DIPP-EPHEMERAL-R-WEIGHTED-v2"
+DIPP_FILE_PROTOCOL_VERSION = "ONE_MIND_DIPP_EPHEMERAL_R_WEIGHTED_V2"
+DIPP_GEOMETRY_PROFILE = "FIXED-WEISZFELD-24-WEIGHTED-8"
+DIPP_KEY_ESTABLISHMENT = "DIPP-ER-WEIGHTED-v2"
+DIPP_VECTOR_BYTES = 64 * 4
+DIPP_COMPONENT_COUNT = 256
+DIPP_MODULUS = 65536
+DIPP_MAX_COORDINATE_ABS = 34_000_000
+USERNAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{2,79}$"
+OPAQUE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"
+MAX_FILE_BYTES = 20 * 1024 * 1024 * 1024
+MAX_CHUNK_BYTES = 16 * 1024 * 1024
+MAX_TOTAL_CHUNKS = 100_000
+MAX_INLINE_UPDATE_BYTES = 128 * 1024 * 1024
+MAX_REQUEST_BYTES = 180 * 1024 * 1024
+MAX_WRAPPED_KEYS = 256
+MAX_AAD_BYTES = 4096
+MAX_AUTHORIZATION_HEADER_BYTES = 4096
+
+
+def reject_control_characters(value: str) -> str:
+    if any(unicodedata.category(char) in {"Cc", "Cf", "Cs"} for char in value):
+        raise ValueError("Karakter kontrol tidak diperbolehkan.")
+    return value
+
+
+def validate_filename_value(value: str) -> str:
+    reject_control_characters(value)
+    if value in {".", ".."} or any(char in value for char in '/\\:*?"<>|'):
+        raise ValueError("Nama file mengandung karakter yang tidak diperbolehkan.")
+    if value.endswith((" ", ".")):
+        raise ValueError("Nama file tidak boleh diakhiri spasi atau titik.")
+    stem = value.split(".", 1)[0].upper()
+    if stem in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+        raise ValueError("Nama file termasuk nama perangkat yang dilarang.")
+    return value
+
+
+Username = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=3, max_length=80, pattern=USERNAME_PATTERN),
+]
+OpaqueId = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=160, pattern=OPAQUE_ID_PATTERN),
+]
+DisplayName = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=160),
+    AfterValidator(reject_control_characters),
+]
+ShortText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=80),
+    AfterValidator(reject_control_characters),
+]
+ReasonText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, max_length=500),
+    AfterValidator(reject_control_characters),
+]
+FilenameText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=240),
+    AfterValidator(validate_filename_value),
+]
+PathUsername = Annotated[str, ApiPath(min_length=3, max_length=80, pattern=USERNAME_PATTERN)]
+PathOpaqueId = Annotated[str, ApiPath(min_length=1, max_length=160, pattern=OPAQUE_ID_PATTERN)]
+PathChunkIndex = Annotated[int, ApiPath(ge=0, lt=MAX_TOTAL_CHUNKS)]
+
+
+class StrictInputModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+def bearer_token(authorization: str | None, detail: str) -> str:
+    if (
+        not authorization
+        or len(authorization.encode("utf-8")) > MAX_AUTHORIZATION_HEADER_BYTES
+        or not authorization.startswith("Bearer ")
+    ):
+        raise HTTPException(status_code=401, detail=detail)
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token or any(unicodedata.category(char) in {"Cc", "Cf", "Cs"} for char in token):
+        raise HTTPException(status_code=401, detail=detail)
+    return token
 
 
 def now_iso() -> str:
@@ -119,6 +210,310 @@ def b64d(text: str) -> bytes:
     return base64.b64decode(text.encode("ascii"))
 
 
+def max_b64_length(byte_length: int) -> int:
+    return ((byte_length + 2) // 3) * 4
+
+
+def decode_standard_b64(value: str, field: str, *, max_bytes: int, exact_bytes: int | None = None) -> bytes:
+    if not isinstance(value, str) or not value or len(value) > max_b64_length(max_bytes):
+        raise HTTPException(status_code=400, detail=f"Ukuran {field} tidak valid.")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(status_code=400, detail=f"{field} bukan Base64 valid.") from exc
+    if len(decoded) > max_bytes or (exact_bytes is not None and len(decoded) != exact_bytes):
+        raise HTTPException(status_code=400, detail=f"Panjang {field} tidak valid.")
+    return decoded
+
+
+def validate_file_envelope(
+    value: dict,
+    *,
+    expected_filename: str,
+    allow_ciphertext: bool,
+) -> bytes | None:
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="Envelope file harus object.")
+    required = {
+        "version", "algorithm", "protocol_version", "file_context_id",
+        "filename", "mime", "aad_b64", "iv_b64",
+    }
+    optional = {"file_id", "uploaded_at"}
+    if allow_ciphertext:
+        required.add("ciphertext_b64")
+    if not required.issubset(value) or set(value) - required - optional:
+        raise HTTPException(status_code=400, detail="Schema envelope file tidak canonical.")
+    if not isinstance(value["version"], int) or isinstance(value["version"], bool) or not 1 <= value["version"] <= 1_000_000:
+        raise HTTPException(status_code=400, detail="Versi envelope file tidak valid.")
+    if value["algorithm"] != "AES-256-GCM" or value["protocol_version"] != DIPP_FILE_PROTOCOL_VERSION:
+        raise HTTPException(status_code=400, detail="Algoritme atau protocol envelope file tidak dikenal.")
+    try:
+        filename = validate_filename_value(str(value["filename"]).strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if filename != expected_filename:
+        raise HTTPException(status_code=400, detail="Nama file pada envelope tidak cocok.")
+    mime = value["mime"]
+    if (
+        not isinstance(mime, str)
+        or not 1 <= len(mime) <= 160
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,79}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,79}", mime)
+    ):
+        raise HTTPException(status_code=400, detail="MIME type tidak valid.")
+    try:
+        reject_control_characters(mime)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    validate_dipp_b64url(value["file_context_id"], 24, "file_context_id")
+    aad = decode_standard_b64(value["aad_b64"], "aad_b64", max_bytes=MAX_AAD_BYTES)
+    try:
+        aad_value = json.loads(aad.decode("utf-8"))
+    except (UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="AAD file tidak valid.") from exc
+    if aad_value != {"filename": filename, "type": mime}:
+        raise HTTPException(status_code=400, detail="AAD file tidak cocok dengan metadata envelope.")
+    decode_standard_b64(value["iv_b64"], "iv_b64", max_bytes=12, exact_bytes=12)
+    if "file_id" in value and (
+        not isinstance(value["file_id"], str)
+        or len(value["file_id"]) > 160
+        or not re.fullmatch(OPAQUE_ID_PATTERN, value["file_id"])
+    ):
+        raise HTTPException(status_code=400, detail="file_id envelope tidak valid.")
+    if "uploaded_at" in value and (
+        not isinstance(value["uploaded_at"], str) or len(value["uploaded_at"]) > 64
+    ):
+        raise HTTPException(status_code=400, detail="uploaded_at envelope tidak valid.")
+    if allow_ciphertext:
+        return decode_standard_b64(
+            value["ciphertext_b64"],
+            "ciphertext_b64",
+            max_bytes=MAX_INLINE_UPDATE_BYTES,
+        )
+    return None
+
+
+def validate_dipp_b64url(value: str, expected_length: int, field: str) -> None:
+    if not isinstance(value, str) or not value or any(
+        char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        for char in value
+    ):
+        raise HTTPException(status_code=400, detail=f"{field} bukan Base64url canonical.")
+    try:
+        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(status_code=400, detail=f"{field} bukan Base64url valid.") from exc
+    canonical = base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=")
+    if len(decoded) != expected_length or canonical != value:
+        raise HTTPException(status_code=400, detail=f"Panjang atau encoding {field} tidak valid.")
+
+
+def validate_dipp_vector(value: str) -> None:
+    validate_dipp_b64url(value, DIPP_VECTOR_BYTES, "vector")
+    raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    for offset in range(0, len(raw), 4):
+        coordinate = int.from_bytes(raw[offset:offset + 4], "big", signed=True)
+        if abs(coordinate) > DIPP_MAX_COORDINATE_ABS:
+            raise HTTPException(
+                status_code=400,
+                detail="Coordinate Ephemeral-R berada di luar domain profile.",
+            )
+
+
+def dipp_transcript(value: dict) -> dict:
+    return {
+        key: value[key]
+        for key in (
+            "version",
+            "parameter_profile",
+            "sender_id",
+            "recipient_id",
+            "recipient_key_id",
+            "public_seed",
+            "B_b",
+            "session_id",
+            "file_context_id",
+            "dipp_components",
+            "algorithms",
+        )
+    }
+
+
+def canonical_json(value: dict) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def validate_dipp_wrapped_key(value: dict) -> None:
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="Wrapped key DIPP harus object.")
+    if "V" in value or "n_bits" in value or str(value.get("algorithm", "")).startswith("DIPP-KEM"):
+        raise HTTPException(status_code=400, detail="Wrapped key DIPP legacy ditolak.")
+    required = {
+        "version",
+        "parameter_profile",
+        "sender_id",
+        "recipient_id",
+        "recipient_key_id",
+        "public_seed",
+        "B_b",
+        "session_id",
+        "file_context_id",
+        "dipp_components",
+        "algorithms",
+        "transcript_hash",
+        "key_establishment_algorithm",
+        "wrap_algorithm",
+        "wrap_nonce",
+        "wrapped_file_key",
+        "sender_signature_algorithm",
+        "sender_signature",
+    }
+    if set(value) != required:
+        raise HTTPException(status_code=400, detail="Schema wrapped key Ephemeral-R tidak canonical.")
+    if value["version"] != DIPP_ENVELOPE_VERSION or value["parameter_profile"] != DIPP_PARAMETER_SET:
+        raise HTTPException(status_code=400, detail="Protocol wrapped key DIPP tidak dikenal.")
+    if (
+        value["key_establishment_algorithm"] != DIPP_KEY_ESTABLISHMENT
+        or value["wrap_algorithm"] != "AES-256-GCM"
+        or value["sender_signature_algorithm"] != "RSA-PKCS1-v1_5-SHA512"
+    ):
+        raise HTTPException(status_code=400, detail="Algoritme pembungkus key tidak dikenal.")
+    if value["algorithms"] != {
+        "geometry": DIPP_GEOMETRY_PROFILE,
+        "extractor": "HKDF-SHA-256",
+        "key_establishment": DIPP_KEY_ESTABLISHMENT,
+    }:
+        raise HTTPException(status_code=400, detail="Suite algoritme Ephemeral-R tidak canonical.")
+    for field in ("session_id", "file_context_id", "sender_id", "recipient_id"):
+        if not isinstance(value[field], str) or not value[field] or len(value[field]) > 160:
+            raise HTTPException(status_code=400, detail=f"Field {field} tidak valid.")
+    if not isinstance(value["recipient_key_id"], str) or not secrets.compare_digest(
+        value["recipient_key_id"], value["recipient_key_id"].lower()
+    ) or len(value["recipient_key_id"]) != 64:
+        raise HTTPException(status_code=400, detail="recipient_key_id tidak valid.")
+    try:
+        bytes.fromhex(value["recipient_key_id"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="recipient_key_id tidak valid.") from exc
+    validate_dipp_b64url(value["public_seed"], 32, "public_seed")
+    validate_dipp_vector(value["B_b"])
+    components = value["dipp_components"]
+    if not isinstance(components, list) or len(components) != DIPP_COMPONENT_COUNT:
+        raise HTTPException(status_code=400, detail="Ephemeral-R wajib memiliki 256 komponen.")
+    seen: set[tuple[str, int]] = set()
+    for component in components:
+        if not isinstance(component, dict) or set(component) != {"U", "V"}:
+            raise HTTPException(status_code=400, detail="Komponen Ephemeral-R tidak canonical.")
+        validate_dipp_vector(component["U"])
+        if not isinstance(component["V"], int) or isinstance(component["V"], bool) or not 0 <= component["V"] < DIPP_MODULUS:
+            raise HTTPException(status_code=400, detail="V_i Ephemeral-R berada di luar Z_q.")
+        fingerprint = (component["U"], component["V"])
+        if fingerprint in seen:
+            raise HTTPException(status_code=400, detail="Komponen Ephemeral-R duplikat.")
+        seen.add(fingerprint)
+    validate_dipp_b64url(value["transcript_hash"], 32, "transcript_hash")
+    validate_dipp_b64url(value["wrap_nonce"], 12, "wrap_nonce")
+    validate_dipp_b64url(value["wrapped_file_key"], 48, "wrapped_file_key")
+    validate_dipp_b64url(value["sender_signature"], 512, "sender_signature")
+    expected_hash = hashlib.sha256(canonical_json(dipp_transcript(value))).digest()
+    actual_hash = base64.urlsafe_b64decode(value["transcript_hash"] + "=" * (-len(value["transcript_hash"]) % 4))
+    if not secrets.compare_digest(expected_hash, actual_hash):
+        raise HTTPException(status_code=400, detail="Hash transcript Ephemeral-R tidak cocok.")
+
+
+def validate_dipp_public_identity(value: dict, username: str) -> None:
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="Public identity DIPP harus object.")
+    required = {
+        "protocol", "version", "type", "user_id", "key_id",
+        "parameter_profile", "public_seed", "B_b",
+    }
+    if set(value) != required:
+        raise HTTPException(status_code=400, detail="Schema public identity DIPP tidak canonical.")
+    if "V" in value or "n_bits" in value or str(value.get("algorithm", "")).startswith("DIPP-KEM"):
+        raise HTTPException(status_code=400, detail="Public identity DIPP legacy ditolak.")
+    if (
+        value.get("protocol") != DIPP_PROTOCOL
+        or value.get("version") != DIPP_PROTOCOL_VERSION
+        or value.get("type") != "ONE_MIND_DIPP_EPHEMERAL_R_STANDALONE_PUBLIC"
+        or value.get("user_id") != username
+        or value.get("parameter_profile") != DIPP_PARAMETER_SET
+    ):
+        raise HTTPException(status_code=400, detail="Public identity Ephemeral-R DIPP standalone tidak valid.")
+    validate_dipp_b64url(value.get("public_seed"), 32, "public_seed")
+    validate_dipp_vector(value.get("B_b"))
+    key_id = value.get("key_id")
+    if not isinstance(key_id, str) or len(key_id) != 64:
+        raise HTTPException(status_code=400, detail="key_id Ephemeral-R tidak valid.")
+    try:
+        bytes.fromhex(key_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="key_id Ephemeral-R tidak valid.") from exc
+    expected_key_id = hashlib.sha256(
+        b"DIPP-ER-WEIGHTED-KEY-ID-v2"
+        + username.encode("utf-8")
+        + base64.urlsafe_b64decode(value["public_seed"] + "=" * (-len(value["public_seed"]) % 4))
+        + base64.urlsafe_b64decode(value["B_b"] + "=" * (-len(value["B_b"]) % 4))
+    ).hexdigest()
+    if not secrets.compare_digest(expected_key_id, key_id):
+        raise HTTPException(status_code=400, detail="key_id Ephemeral-R tidak cocok dengan public material.")
+
+
+def validate_pki_public_key(value: str) -> None:
+    try:
+        public_key = serialization.load_pem_public_key(value.encode("ascii"))
+    except (AttributeError, UnicodeError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail="RSA public key registrasi tidak valid.") from exc
+    if not isinstance(public_key, rsa.RSAPublicKey):
+        raise HTTPException(status_code=400, detail="Login public key wajib RSA.")
+    numbers = public_key.public_numbers()
+    if public_key.key_size != 4096 or numbers.e != 65537:
+        raise HTTPException(status_code=400, detail="RSA login key wajib 4096-bit dengan exponent 65537.")
+
+
+def register_dipp_ciphertext(conn: sqlite3.Connection, value: dict, sender: str, recipient: str) -> None:
+    validate_dipp_wrapped_key(value)
+    if value["sender_id"] != sender or value["recipient_id"] != recipient:
+        raise HTTPException(status_code=400, detail="Binding sender/recipient Ephemeral-R tidak cocok.")
+    rows = conn.execute(
+        "SELECT username, public_key, pki_public_key, account_status FROM users WHERE username IN (?, ?)",
+        (sender, recipient),
+    ).fetchall()
+    users_by_name = {row["username"]: row for row in rows}
+    if sender not in users_by_name or recipient not in users_by_name:
+        raise HTTPException(status_code=404, detail="Identitas Ephemeral-R tidak ditemukan.")
+    if any(users_by_name[name]["account_status"] != "ACTIVE" for name in {sender, recipient}):
+        raise HTTPException(status_code=403, detail="Akun Ephemeral-R tidak aktif.")
+    recipient_public = json.loads(users_by_name[recipient]["public_key"])
+    validate_dipp_public_identity(recipient_public, recipient)
+    for field, public_field in (("recipient_key_id", "key_id"), ("public_seed", "public_seed"), ("B_b", "B_b")):
+        if not secrets.compare_digest(value[field], recipient_public[public_field]):
+            raise HTTPException(status_code=400, detail="Public material penerima pada transcript tidak cocok.")
+    try:
+        signing_key = serialization.load_pem_public_key(users_by_name[sender]["pki_public_key"].encode("ascii"))
+        signature = base64.urlsafe_b64decode(value["sender_signature"] + "=" * (-len(value["sender_signature"]) % 4))
+        transcript_hash = base64.urlsafe_b64decode(value["transcript_hash"] + "=" * (-len(value["transcript_hash"]) % 4))
+        signing_key.verify(signature, transcript_hash, padding.PKCS1v15(), hashes.SHA512())
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail="Public signing key pengirim tidak valid.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Signature transcript Ephemeral-R tidak valid.") from exc
+    try:
+        conn.execute(
+            """
+            INSERT INTO dipp_ciphertexts (
+                session_id, sender_id, recipient_id, recipient_key_id,
+                transcript_hash, file_context_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                value["session_id"], sender, recipient, value["recipient_key_id"],
+                value["transcript_hash"], value["file_context_id"], now_iso(),
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="Session/transcript Ephemeral-R sudah pernah digunakan.") from exc
+
+
 def new_id(n: int = 16) -> str:
     return secrets.token_hex(n // 2)
 
@@ -137,6 +532,21 @@ def envelope_path(file_id: str, create_dir: bool = True) -> Path:
     if create_dir:
         folder.mkdir(parents=True, exist_ok=True)
     return folder / "envelope.json"
+
+
+def stored_file_context(file_id: str) -> str:
+    path = envelope_path(file_id, create_dir=False)
+    try:
+        if not path.is_file() or path.stat().st_size > 64 * 1024:
+            raise ValueError("Envelope file tidak tersedia atau terlalu besar.")
+        value = json.loads(path.read_text(encoding="utf-8"))
+        context = value.get("file_context_id")
+        validate_dipp_b64url(context, 24, "file_context_id")
+        return context
+    except HTTPException:
+        raise
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail="Metadata envelope file tidak valid.") from exc
 
 
 def ciphertext_chunk_path(file_id: str, chunk_index: int) -> Path:
@@ -160,6 +570,7 @@ def sign_token(username: str) -> str:
         "type": "user",
         "username": username,
         "nonce": nonce,
+        "idle": SESSION_SECONDS,
         "exp": int(time.time()) + SESSION_SECONDS,
     }
     raw = b64e(json.dumps(payload, sort_keys=True).encode("utf-8"))
@@ -228,6 +639,7 @@ def sign_admin_token(username: str) -> str:
         "type": "admin",
         "username": username,
         "nonce": nonce,
+        "idle": ADMIN_SESSION_SECONDS,
         "exp": int(time.time()) + ADMIN_SESSION_SECONDS,
     }
     raw = b64e(json.dumps(payload, sort_keys=True).encode("utf-8"))
@@ -489,6 +901,23 @@ def db() -> sqlite3.Connection:
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        DROP TABLE IF EXISTS dipp_sessions;
+
+        CREATE TABLE IF NOT EXISTS dipp_ciphertexts (
+            session_id TEXT PRIMARY KEY,
+            sender_id TEXT NOT NULL,
+            recipient_id TEXT NOT NULL,
+            recipient_key_id TEXT NOT NULL,
+            transcript_hash TEXT NOT NULL UNIQUE,
+            file_context_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(sender_id) REFERENCES users(username),
+            FOREIGN KEY(recipient_id) REFERENCES users(username)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_dipp_ciphertexts_recipient
+        ON dipp_ciphertexts(recipient_id, created_at);
         """
     )
 
@@ -540,32 +969,26 @@ def db() -> sqlite3.Connection:
             "ALTER TABLE files ADD COLUMN is_hidden INTEGER NOT NULL DEFAULT 1"
         )
 
-    file_migrations = [
-        (
-            "storage_format",
-            "ALTER TABLE files ADD COLUMN storage_format TEXT NOT NULL DEFAULT 'chunked-v1'",
-        ),
-        (
-            "chunk_size",
-            "ALTER TABLE files ADD COLUMN chunk_size INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "total_chunks",
-            "ALTER TABLE files ADD COLUMN total_chunks INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "ciphertext_size",
-            "ALTER TABLE files ADD COLUMN ciphertext_size INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "ciphertext_sha256",
-            "ALTER TABLE files ADD COLUMN ciphertext_sha256 TEXT NOT NULL DEFAULT ''",
-        ),
-    ]
-
-    for column_name, sql in file_migrations:
-        if column_name not in file_columns:
-            conn.execute(sql)
+    if "storage_format" not in file_columns:
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN storage_format TEXT NOT NULL DEFAULT 'chunked-v1'"
+        )
+    if "chunk_size" not in file_columns:
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN chunk_size INTEGER NOT NULL DEFAULT 0"
+        )
+    if "total_chunks" not in file_columns:
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN total_chunks INTEGER NOT NULL DEFAULT 0"
+        )
+    if "ciphertext_size" not in file_columns:
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN ciphertext_size INTEGER NOT NULL DEFAULT 0"
+        )
+    if "ciphertext_sha256" not in file_columns:
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN ciphertext_sha256 TEXT NOT NULL DEFAULT ''"
+        )
 
     # ==========================================================
     # USERS MIGRATION
@@ -578,75 +1001,34 @@ def db() -> sqlite3.Connection:
         ).fetchall()
     }
 
-    user_migrations = [
-
-        (
-            "nip",
-            "ALTER TABLE users ADD COLUMN nip TEXT NOT NULL DEFAULT ''"
-        ),
-
-        (
-            "rank",
-            "ALTER TABLE users ADD COLUMN rank TEXT NOT NULL DEFAULT ''"
-        ),
-
-        (
-            "position",
-            "ALTER TABLE users ADD COLUMN position TEXT NOT NULL DEFAULT ''"
-        ),
-
-        (
-            "pki_public_key",
-            "ALTER TABLE users ADD COLUMN pki_public_key TEXT"
-        ),
-
-        (
-            "account_status",
+    if "nip" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN nip TEXT NOT NULL DEFAULT ''")
+    if "rank" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN rank TEXT NOT NULL DEFAULT ''")
+    if "position" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN position TEXT NOT NULL DEFAULT ''")
+    if "pki_public_key" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN pki_public_key TEXT")
+    if "account_status" not in user_columns:
+        conn.execute(
             "ALTER TABLE users ADD COLUMN account_status TEXT NOT NULL DEFAULT 'PENDING'"
-        ),
-
-        (
-            "certificate_status",
-            "ALTER TABLE users ADD COLUMN certificate_status TEXT NOT NULL DEFAULT 'NONE'"
-        ),
-
-        (
-            "approved_at",
-            "ALTER TABLE users ADD COLUMN approved_at TEXT"
-        ),
-
-        (
-            "approved_by",
-            "ALTER TABLE users ADD COLUMN approved_by TEXT"
-        ),
-
-        (
-            "revoked_at",
-            "ALTER TABLE users ADD COLUMN revoked_at TEXT"
-        ),
-
-        (
-            "revoked_by",
-            "ALTER TABLE users ADD COLUMN revoked_by TEXT"
-        ),
-
-        (
-            "deleted_at",
-            "ALTER TABLE users ADD COLUMN deleted_at TEXT"
-        ),
-
-        (
-            "deleted_by",
-            "ALTER TABLE users ADD COLUMN deleted_by TEXT"
         )
-
-    ]
-
-    for column_name, sql in user_migrations:
-
-        if column_name not in user_columns:
-
-            conn.execute(sql)
+    if "certificate_status" not in user_columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN certificate_status TEXT NOT NULL DEFAULT 'NONE'"
+        )
+    if "approved_at" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN approved_at TEXT")
+    if "approved_by" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN approved_by TEXT")
+    if "revoked_at" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN revoked_at TEXT")
+    if "revoked_by" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN revoked_by TEXT")
+    if "deleted_at" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN deleted_at TEXT")
+    if "deleted_by" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN deleted_by TEXT")
 
     conn.commit()
 
@@ -711,11 +1093,8 @@ def reconcile_certificates_after_ca_rotation(conn: sqlite3.Connection) -> int:
 def current_pending_login_user(
     authorization: str | None = Header(default=None),
 ) -> str:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Token proses login diperlukan.")
-
     username = verify_pending_login_token(
-        authorization.removeprefix("Bearer ").strip()
+        bearer_token(authorization, "Token proses login diperlukan.")
     )
 
     conn = db()
@@ -733,9 +1112,7 @@ def current_pending_login_user(
 
 
 def current_user(authorization: str | None = Header(default=None)) -> str:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Login diperlukan.")
-    username = verify_token(authorization.removeprefix("Bearer ").strip())
+    username = verify_token(bearer_token(authorization, "Login diperlukan."))
 
     conn = db()
     row = conn.execute(
@@ -778,9 +1155,9 @@ def enforce_active_account(account_status: str) -> None:
 
 
 def current_admin(authorization: str | None = Header(default=None)) -> str:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Login admin diperlukan.")
-    admin_username = verify_admin_token(authorization.removeprefix("Bearer ").strip())
+    admin_username = verify_admin_token(
+        bearer_token(authorization, "Login admin diperlukan.")
+    )
 
     conn = db()
     exists = conn.execute(
@@ -859,47 +1236,49 @@ def record_admin_audit(
     )
 
 
-class RegisterIn(BaseModel):
+class RegisterIn(StrictInputModel):
 
-    username: str
-    display_name: str
+    username: Username
+    display_name: DisplayName
     password: str = Field(
         min_length=PASSWORD_MIN_LENGTH,
         max_length=PASSWORD_MAX_LENGTH,
     )
     # Identitas Personel
-    nip: str
-    rank: str
-    position: str
+    nip: ShortText
+    rank: ShortText
+    position: DisplayName
     # DIPP
-    public_key: dict
+    public_key: dict = Field(max_length=8)
     # PKI
-    pki_public_key: str
-class LoginIn(BaseModel):
-    username: str
+    pki_public_key: str = Field(min_length=256, max_length=10_000)
+
+
+class LoginIn(StrictInputModel):
+    username: Username
     password: str = Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)
 
 
-class LoginVerifyIn(BaseModel):
-    nonce: str
-    signature: str
-    public_key_pem: str
+class LoginVerifyIn(StrictInputModel):
+    nonce: str = Field(min_length=16, max_length=160, pattern=OPAQUE_ID_PATTERN)
+    signature: str = Field(min_length=256, max_length=1024)
+    public_key_pem: str = Field(min_length=256, max_length=10_000)
 
 
-class AdminSetupIn(BaseModel):
-    username: str = Field(min_length=3, max_length=80)
+class AdminSetupIn(StrictInputModel):
+    username: Username
     password: str = Field(
         min_length=PASSWORD_MIN_LENGTH,
         max_length=PASSWORD_MAX_LENGTH,
     )
 
 
-class AdminLoginIn(BaseModel):
-    username: str
+class AdminLoginIn(StrictInputModel):
+    username: Username
     password: str = Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)
 
 
-class AdminPasswordChangeIn(BaseModel):
+class AdminPasswordChangeIn(StrictInputModel):
     current_password: str = Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)
     new_password: str = Field(
         min_length=PASSWORD_MIN_LENGTH,
@@ -907,19 +1286,19 @@ class AdminPasswordChangeIn(BaseModel):
     )
 
 
-class AdminUserEditIn(BaseModel):
-    display_name: str = Field(min_length=1, max_length=160)
-    nip: str = Field(min_length=1, max_length=80)
-    rank: str = Field(min_length=1, max_length=80)
-    position: str = Field(min_length=1, max_length=160)
+class AdminUserEditIn(StrictInputModel):
+    display_name: DisplayName
+    nip: ShortText
+    rank: ShortText
+    position: DisplayName
 
 
-class AdminUserReasonIn(BaseModel):
-    reason: str | None = Field(default=None, max_length=500)
+class AdminUserReasonIn(StrictInputModel):
+    reason: ReasonText | None = None
 
 
-class FileUploadIn(BaseModel):
-    filename: str = Field(min_length=1, max_length=240)
+class FileUploadIn(StrictInputModel):
+    filename: FilenameText
     envelope: dict
     wrapped_key_for_owner: dict
 
@@ -927,59 +1306,77 @@ class CertificateChallengeOut(BaseModel):
     nonce: str
 
 
-class ShareIn(BaseModel):
-    file_id: str
-    recipient: str
+class ShareIn(StrictInputModel):
+    file_id: OpaqueId
+    recipient: Username
     wrapped_key: dict
     permission: Literal["viewer", "editor"] = "viewer"
-class UploadStartIn(BaseModel):
-    filename: str = Field(min_length=1, max_length=240)
-    file_size: int = Field(gt=0)
-    chunk_size: int = Field(gt=0)
-    total_chunks: int = Field(gt=0)
 
-class UploadChunkIn(BaseModel):
-    upload_id: str
-    chunk_index: int = Field(ge=0)
-    total_chunks: int = Field(gt=0)
-    data_b64: str
 
-class UploadFinishIn(BaseModel):
-    upload_id: str
+class UploadStartIn(StrictInputModel):
+    filename: FilenameText
+    file_size: int = Field(gt=0, le=MAX_FILE_BYTES)
+    chunk_size: int = Field(gt=0, le=MAX_CHUNK_BYTES)
+    total_chunks: int = Field(gt=0, le=MAX_TOTAL_CHUNKS)
+
+
+class UploadChunkIn(StrictInputModel):
+    upload_id: OpaqueId
+    chunk_index: int = Field(ge=0, lt=MAX_TOTAL_CHUNKS)
+    total_chunks: int = Field(gt=0, le=MAX_TOTAL_CHUNKS)
+    data_b64: str = Field(min_length=4, max_length=max_b64_length(MAX_CHUNK_BYTES))
+
+
+class UploadFinishIn(StrictInputModel):
+    upload_id: OpaqueId
     envelope: dict
     wrapped_key_for_owner: dict
-    ciphertext_sha256: str
+    ciphertext_sha256: str = Field(min_length=44, max_length=44)
     is_hidden: bool = True
 
-class WrappedKeyIn(BaseModel):
-    recipient: str
+
+class WrappedKeyIn(StrictInputModel):
+    recipient: Username
     wrapped_key: dict
 
 
-class FileUpdateIn(BaseModel):
-    filename: str = Field(min_length=1, max_length=240)
+class FileUpdateIn(StrictInputModel):
+    filename: FilenameText
     envelope: dict
-    wrapped_keys: list[WrappedKeyIn] = Field(min_length=1)
+    wrapped_keys: list[WrappedKeyIn] = Field(min_length=1, max_length=MAX_WRAPPED_KEYS)
 
 
-class FileRenameIn(BaseModel):
-    filename: str = Field(min_length=1, max_length=240)
+class FileRenameIn(StrictInputModel):
+    filename: FilenameText
 
 
-class FileVisibilityIn(BaseModel):
+class FileVisibilityIn(StrictInputModel):
     is_hidden: bool
 
 
-class FileRequestApprovalIn(BaseModel):
+class FileRequestApprovalIn(StrictInputModel):
     wrapped_key: dict
 
 
-app = FastAPI(title="ONE_MIND", version="2.0")
+app = FastAPI(title="ONE_MIND DIPP Ephemeral-R", version="4.0-dipp-ephemeral-r")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
+    if request.url.path.startswith("/api/") and request.method in {"POST", "PUT", "PATCH"}:
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            return JSONResponse(status_code=415, content={"detail": "Content-Type wajib application/json."})
+        raw_length = request.headers.get("content-length")
+        if raw_length is None:
+            return JSONResponse(status_code=411, content={"detail": "Content-Length wajib dikirim."})
+        try:
+            content_length = int(raw_length)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "Content-Length tidak valid."})
+        if content_length < 0 or content_length > MAX_REQUEST_BYTES:
+            return JSONResponse(status_code=413, content={"detail": "Request body terlalu besar."})
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -987,7 +1384,7 @@ async def security_headers(request: Request, call_next):
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
-        "script-src 'self'; "
+        "script-src 'self' 'wasm-unsafe-eval'; "
         "style-src 'self'; "
         "img-src 'self' data:; "
         "connect-src 'self'; "
@@ -1016,7 +1413,12 @@ def startup():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "transport": "HTTPS/TLS when run via docker entrypoint"}
+    return {
+        "ok": True,
+        "transport": "HTTPS/TLS when run via docker entrypoint",
+        "crypto_profile": DIPP_FILE_PROTOCOL_VERSION,
+        "server_knowledge": "public-transcript-and-ciphertext-only",
+    }
 
 
 @app.get("/api/admin/setup-status")
@@ -1138,6 +1540,16 @@ def admin_me(admin_username: str = Depends(current_admin)):
     return {"username": admin_username}
 
 
+@app.post("/api/admin/session/refresh")
+def refresh_admin_session(admin_username: str = Depends(current_admin)):
+    """Perpanjang jendela idle admin setelah aktivitas nyata di browser."""
+    return {
+        "token": sign_admin_token(admin_username),
+        "username": admin_username,
+        "idle_timeout_seconds": ADMIN_SESSION_SECONDS,
+    }
+
+
 @app.post("/api/admin/change-password")
 def admin_change_password(
     data: AdminPasswordChangeIn,
@@ -1255,7 +1667,7 @@ def admin_users(admin_username: str = Depends(current_admin)):
 
 @app.patch("/api/admin/users/{target_username}")
 def admin_edit_user(
-    target_username: str,
+    target_username: PathUsername,
     data: AdminUserEditIn,
     admin_username: str = Depends(current_admin),
 ):
@@ -1315,7 +1727,7 @@ def admin_edit_user(
 
 @app.post("/api/admin/users/{target_username}/approve")
 def admin_approve_user(
-    target_username: str,
+    target_username: PathUsername,
     admin_username: str = Depends(current_admin),
 ):
     conn = db()
@@ -1392,7 +1804,7 @@ def admin_approve_user(
 
 @app.post("/api/admin/users/{target_username}/reject")
 def admin_reject_user(
-    target_username: str,
+    target_username: PathUsername,
     data: AdminUserReasonIn,
     admin_username: str = Depends(current_admin),
 ):
@@ -1446,7 +1858,7 @@ def admin_reject_user(
 
 @app.post("/api/admin/users/{target_username}/revoke")
 def admin_revoke_user(
-    target_username: str,
+    target_username: PathUsername,
     data: AdminUserReasonIn,
     admin_username: str = Depends(current_admin),
 ):
@@ -1502,7 +1914,7 @@ def admin_revoke_user(
 
 @app.post("/api/admin/users/{target_username}/restore")
 def admin_restore_user(
-    target_username: str,
+    target_username: PathUsername,
     admin_username: str = Depends(current_admin),
 ):
     conn = db()
@@ -1553,7 +1965,7 @@ def admin_restore_user(
 
 @app.post("/api/admin/users/{target_username}/soft-delete")
 def admin_soft_delete_user(
-    target_username: str,
+    target_username: PathUsername,
     admin_username: str = Depends(current_admin),
 ):
     conn = db()
@@ -1592,7 +2004,8 @@ def admin_soft_delete_user(
 
 @app.post("/api/register")
 def register(data: RegisterIn):
-
+    validate_dipp_public_identity(data.public_key, data.username)
+    validate_pki_public_key(data.pki_public_key)
     conn = db()
 
     try:
@@ -2103,6 +2516,16 @@ def me(username: str = Depends(current_user)):
     return dict(row) | {"public_key": json.loads(row["public_key"])}
 
 
+@app.post("/api/session/refresh")
+def refresh_user_session(username: str = Depends(current_user)):
+    """Perpanjang jendela idle user setelah aktivitas nyata di browser."""
+    return {
+        "token": sign_token(username),
+        "username": username,
+        "idle_timeout_seconds": SESSION_SECONDS,
+    }
+
+
 @app.get("/api/users")
 def users(username: str = Depends(current_user)):
     conn = db()
@@ -2118,7 +2541,7 @@ def users(username: str = Depends(current_user)):
 
 
 @app.get("/api/users/{target_username}/public-key")
-def user_public_key(target_username: str, username: str = Depends(current_user)):
+def user_public_key(target_username: PathUsername, username: str = Depends(current_user)):
     conn = db()
     row = conn.execute(
         "SELECT username, display_name, public_key FROM users WHERE username=?",
@@ -2128,6 +2551,19 @@ def user_public_key(target_username: str, username: str = Depends(current_user))
     if not row:
         raise HTTPException(status_code=404, detail="User tidak ditemukan.")
     return {"username": row["username"], "display_name": row["display_name"], "public_key": json.loads(row["public_key"])}
+
+
+@app.get("/api/users/{target_username}/pki-public-key")
+def user_pki_public_key(target_username: PathUsername, username: str = Depends(current_user)):
+    conn = db()
+    row = conn.execute(
+        "SELECT username, pki_public_key, account_status FROM users WHERE username=?",
+        (target_username,),
+    ).fetchone()
+    conn.close()
+    if not row or row["account_status"] != "ACTIVE":
+        raise HTTPException(status_code=404, detail="Public signing key user aktif tidak ditemukan.")
+    return {"username": row["username"], "pki_public_key": row["pki_public_key"]}
 
 
 @app.get("/api/file-catalog")
@@ -2223,7 +2659,7 @@ def list_file_requests(username: str = Depends(current_user)):
 
 
 @app.post("/api/files/{file_id}/requests")
-def create_file_request(file_id: str, username: str = Depends(current_user)):
+def create_file_request(file_id: PathOpaqueId, username: str = Depends(current_user)):
     conn = db()
     conn.execute("BEGIN IMMEDIATE")
     file_row = conn.execute(
@@ -2275,10 +2711,11 @@ def create_file_request(file_id: str, username: str = Depends(current_user)):
 
 @app.post("/api/file-requests/{request_id}/approve")
 def approve_file_request(
-    request_id: str,
+    request_id: PathOpaqueId,
     data: FileRequestApprovalIn,
     username: str = Depends(current_user),
 ):
+    validate_dipp_wrapped_key(data.wrapped_key)
     conn = db()
     conn.execute("BEGIN IMMEDIATE")
     request_row = conn.execute(
@@ -2304,12 +2741,22 @@ def approve_file_request(
     if request_row["requester_status"] != "ACTIVE":
         conn.close()
         raise HTTPException(status_code=409, detail="Akun peminta tidak aktif.")
+    if (
+        data.wrapped_key["sender_id"] != username
+        or data.wrapped_key["recipient_id"] != request_row["requester"]
+    ):
+        conn.close()
+        raise HTTPException(status_code=400, detail="Wrapped key approval tidak terikat ke peminta.")
+    if data.wrapped_key["file_context_id"] != stored_file_context(request_row["file_id"]):
+        conn.close()
+        raise HTTPException(status_code=400, detail="File context wrapped key approval tidak cocok.")
 
     existing_share = conn.execute(
         "SELECT 1 FROM shares WHERE file_id=? AND recipient=?",
         (request_row["file_id"], request_row["requester"]),
     ).fetchone()
     if not existing_share:
+        register_dipp_ciphertext(conn, data.wrapped_key, username, request_row["requester"])
         conn.execute(
             """
             INSERT INTO shares (
@@ -2335,7 +2782,7 @@ def approve_file_request(
 
 
 @app.post("/api/file-requests/{request_id}/reject")
-def reject_file_request(request_id: str, username: str = Depends(current_user)):
+def reject_file_request(request_id: PathOpaqueId, username: str = Depends(current_user)):
     conn = db()
     conn.execute("BEGIN IMMEDIATE")
     request_row = conn.execute(
@@ -2544,9 +2991,11 @@ def upload_chunk(
 
         conn.rollback()
 
+        print(f"[Upload] Gagal menyimpan chunk: {type(e).__name__}")
+
         raise HTTPException(
             status_code=500,
-            detail=f"Gagal menyimpan chunk: {e}"
+            detail="Gagal menyimpan chunk."
         )
 
     finally:
@@ -2566,6 +3015,12 @@ def upload_finish(
     data: UploadFinishIn,
     username: str = Depends(current_user)
 ):
+    validate_dipp_wrapped_key(data.wrapped_key_for_owner)
+    if (
+        data.wrapped_key_for_owner["sender_id"] != username
+        or data.wrapped_key_for_owner["recipient_id"] != username
+    ):
+        raise HTTPException(status_code=400, detail="Wrapped key owner tidak terikat ke pemilik.")
     conn = db()
     upload_dir = TEMP_UPLOAD_DIR / data.upload_id
     target_dir = None
@@ -2598,6 +3053,21 @@ def upload_finish(
                 status_code=403,
                 detail="Upload session bukan milik Anda."
             )
+
+        validate_file_envelope(
+            data.envelope,
+            expected_filename=row["filename"],
+            allow_ciphertext=False,
+        )
+        if data.wrapped_key_for_owner["file_context_id"] != data.envelope["file_context_id"]:
+            raise HTTPException(status_code=400, detail="File context wrapped key tidak cocok dengan envelope.")
+        decode_standard_b64(
+            data.ciphertext_sha256,
+            "ciphertext_sha256",
+            max_bytes=32,
+            exact_bytes=32,
+        )
+        register_dipp_ciphertext(conn, data.wrapped_key_for_owner, username, username)
 
         if not upload_dir.exists():
             raise HTTPException(
@@ -2829,7 +3299,7 @@ def list_files(username: str =Depends(current_user)):
     return result
 
 @app.get("/api/files/{file_id}")
-def download_file(file_id: str, username: str = Depends(current_user)):
+def download_file(file_id: PathOpaqueId, username: str = Depends(current_user)):
     conn = db()
 
     row = conn.execute(
@@ -2879,8 +3349,8 @@ def download_file(file_id: str, username: str = Depends(current_user)):
 
 @app.get("/api/files/{file_id}/chunks/{chunk_index}")
 def download_file_chunk(
-    file_id: str,
-    chunk_index: int,
+    file_id: PathOpaqueId,
+    chunk_index: PathChunkIndex,
     username: str = Depends(current_user),
 ):
     conn = db()
@@ -2937,7 +3407,7 @@ def download_file_chunk(
     )
 
 @app.get("/api/files/{file_id}/access")
-def file_access(file_id: str, username: str = Depends(current_user)):
+def file_access(file_id: PathOpaqueId, username: str = Depends(current_user)):
     conn = db()
     require_file_permission(conn, file_id, username, {"owner", "editor", "viewer"})
     rows = conn.execute(
@@ -2963,7 +3433,7 @@ def file_access(file_id: str, username: str = Depends(current_user)):
 
 
 @app.patch("/api/files/{file_id}")
-def rename_file(file_id: str, data: FileRenameIn, username: str = Depends(current_user)):
+def rename_file(file_id: PathOpaqueId, data: FileRenameIn, username: str = Depends(current_user)):
     conn = db()
     require_file_permission(conn, file_id, username, {"owner", "editor"})
     conn.execute("UPDATE files SET filename=? WHERE id=?", (data.filename, file_id))
@@ -2974,7 +3444,7 @@ def rename_file(file_id: str, data: FileRenameIn, username: str = Depends(curren
 
 @app.patch("/api/files/{file_id}/visibility")
 def update_file_visibility(
-    file_id: str,
+    file_id: PathOpaqueId,
     data: FileVisibilityIn,
     username: str = Depends(current_user),
 ):
@@ -3006,7 +3476,25 @@ def update_file_visibility(
 
 
 @app.put("/api/files/{file_id}")
-def update_file(file_id: str, data: FileUpdateIn, username: str = Depends(current_user)):
+def update_file(file_id: PathOpaqueId, data: FileUpdateIn, username: str = Depends(current_user)):
+    ciphertext = validate_file_envelope(
+        data.envelope,
+        expected_filename=data.filename,
+        allow_ciphertext=True,
+    )
+    if data.envelope.get("file_id") not in {None, file_id}:
+        raise HTTPException(status_code=400, detail="file_id envelope tidak cocok dengan target update.")
+    recipients = [item.recipient for item in data.wrapped_keys]
+    if len(set(recipients)) != len(recipients):
+        raise HTTPException(status_code=400, detail="Penerima wrapped key tidak boleh duplikat.")
+    for wrapped_key in data.wrapped_keys:
+        validate_dipp_wrapped_key(wrapped_key.wrapped_key)
+        if wrapped_key.wrapped_key["recipient_id"] != wrapped_key.recipient:
+            raise HTTPException(status_code=400, detail="recipient_id wrapped key tidak cocok.")
+        if wrapped_key.wrapped_key["sender_id"] != username:
+            raise HTTPException(status_code=400, detail="sender_id wrapped key tidak cocok.")
+        if wrapped_key.wrapped_key["file_context_id"] != data.envelope["file_context_id"]:
+            raise HTTPException(status_code=400, detail="File context wrapped key tidak cocok dengan envelope.")
     conn = db()
     staging_dir = None
     backup_dir = None
@@ -3024,19 +3512,6 @@ def update_file(file_id: str, data: FileUpdateIn, username: str = Depends(curren
                 detail="Format penyimpanan file tidak dapat di-update.",
             )
 
-        ciphertext_text = data.envelope.get("ciphertext_b64")
-        if not isinstance(ciphertext_text, str):
-            raise HTTPException(
-                status_code=400,
-                detail="Ciphertext update tidak tersedia.",
-            )
-        try:
-            ciphertext = base64.b64decode(ciphertext_text, validate=True)
-        except (binascii.Error, ValueError, TypeError) as exc:
-            raise HTTPException(
-                status_code=400,
-                detail="Ciphertext update bukan Base64 yang valid.",
-            ) from exc
         if not ciphertext:
             raise HTTPException(status_code=400, detail="Ciphertext update kosong.")
 
@@ -3080,6 +3555,8 @@ def update_file(file_id: str, data: FileUpdateIn, username: str = Depends(curren
                 status_code=400,
                 detail="Wrapped key harus dibuat ulang untuk semua user yang masih punya akses.",
             )
+        for item in data.wrapped_keys:
+            register_dipp_ciphertext(conn, item.wrapped_key, username, item.recipient)
 
         if not target_dir.is_dir():
             raise HTTPException(status_code=500, detail="Folder file aktif tidak ditemukan.")
@@ -3133,7 +3610,7 @@ def update_file(file_id: str, data: FileUpdateIn, username: str = Depends(curren
     }
 
 @app.delete("/api/files/{file_id}")
-def delete_file(file_id: str, username: str = Depends(current_user)):
+def delete_file(file_id: PathOpaqueId, username: str = Depends(current_user)):
     conn = db()
     require_file_permission(conn, file_id, username, {"owner"})
     row = conn.execute("SELECT id FROM files WHERE id=?", (file_id,)).fetchone()
@@ -3151,6 +3628,12 @@ def delete_file(file_id: str, username: str = Depends(current_user)):
 
 @app.post("/api/share")
 def share_file(data: ShareIn, username: str = Depends(current_user)):
+    validate_dipp_wrapped_key(data.wrapped_key)
+    if (
+        data.wrapped_key["sender_id"] != username
+        or data.wrapped_key["recipient_id"] != data.recipient
+    ):
+        raise HTTPException(status_code=400, detail="Wrapped key share tidak terikat ke pengirim/penerima.")
     conn = db()
     require_file_permission(conn, data.file_id, username, {"owner"})
     if not conn.execute("SELECT 1 FROM users WHERE username=?", (data.recipient,)).fetchone():
@@ -3159,6 +3642,10 @@ def share_file(data: ShareIn, username: str = Depends(current_user)):
     if data.recipient == username:
         conn.close()
         raise HTTPException(status_code=400, detail="Pemilik sudah punya akses owner.")
+    if data.wrapped_key["file_context_id"] != stored_file_context(data.file_id):
+        conn.close()
+        raise HTTPException(status_code=400, detail="File context wrapped key share tidak cocok.")
+    register_dipp_ciphertext(conn, data.wrapped_key, username, data.recipient)
     owner = conn.execute("SELECT owner FROM files WHERE id=?", (data.file_id,)).fetchone()["owner"]
     conn.execute("DELETE FROM shares WHERE file_id=? AND recipient=?", (data.file_id, data.recipient))
     conn.execute(
@@ -3179,7 +3666,7 @@ def share_file(data: ShareIn, username: str = Depends(current_user)):
 
 
 @app.delete("/api/files/{file_id}/shares/{recipient}")
-def revoke_share(file_id: str, recipient: str, username: str = Depends(current_user)):
+def revoke_share(file_id: PathOpaqueId, recipient: PathUsername, username: str = Depends(current_user)):
     conn = db()
     require_file_permission(conn, file_id, username, {"owner"})
     owner = conn.execute("SELECT owner FROM files WHERE id=?", (file_id,)).fetchone()["owner"]

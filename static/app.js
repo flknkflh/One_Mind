@@ -27,7 +27,9 @@ const dippSession = {
 
     publicKey: null,
 
-    username: null
+    username: null,
+
+    runtime: null
 
 };
 
@@ -46,6 +48,9 @@ const PKI_HASH = "SHA-512";
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const BACKUP_KEY_ITERATIONS = 600000;
+const MAX_FILE_BYTES = 20 * 1024 * 1024 * 1024;
+const MAX_INLINE_UPDATE_BYTES = 128 * 1024 * 1024;
+const MAX_IDENTITY_FILE_BYTES = 1024 * 1024;
 // const SESSION_UNLOCK_MS = 15 * 60 * 1000;
 const CHUNK_PROFILES = [
 
@@ -612,161 +617,12 @@ async function adminApi(path, options = {}) {
 }
 
 
-const DIPP_ALGORITHM_NAME = "DIPP-KEM-v2 (Weiszfeld, parameter optimasi 2026)";
-const DIPP_VERSION = 2;
-const DIPP_PARAMS = {
-  dim: 3,
-  n_pub: 20,
-  coord_max: 1000,
-  w_range: [0.01, 0.15],
-  delta_range: [-0.1, 0.1],
-  q: 4096,
-  scale: 100,
-  error_bound: 8,
-  error_geser: 0,
-  dither_bound: 0,
-  v_shift_bound: 8,
-  repeat: 5,
-};
+const DIPP_ALGORITHM_NAME = "DIPP Ephemeral-R Standalone";
+const DIPP_VERSION = 7;
+const DIPP_PARAMS = OneMindDippEphemeralR.PARAMS;
 
-function randU32() {
-  const buf = new Uint32Array(1);
-  crypto.getRandomValues(buf);
-  return buf[0];
-}
-
-function randFloat() {
-  return randU32() / 0x100000000;
-}
-
-function randInt(min, maxInclusive) {
-  return min + Math.floor(randFloat() * (maxInclusive - min + 1));
-}
-
-function randUniform(min, max) {
-  return min + randFloat() * (max - min);
-}
-
-function boundedIntegerNoise(bound) {
-  const normalizedBound = Math.max(0, Math.floor(Number(bound) || 0));
-  return normalizedBound === 0
-    ? 0
-    : randInt(-normalizedBound, normalizedBound);
-}
-
-function positiveModulo(value, modulus) {
-  return ((value % modulus) + modulus) % modulus;
-}
-
-function randNormal() {
-  const u1 = Math.max(randFloat(), Number.EPSILON);
-  const u2 = randFloat();
-  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-}
-
-function vectorNorm(v) {
-  return Math.sqrt(v.reduce((sum, x) => sum + x * x, 0));
-}
-
-function distance(a, b) {
-  let sum = 0;
-  for (let i = 0; i < a.length; i++) sum += (a[i] - b[i]) ** 2;
-  return Math.sqrt(sum);
-}
-
-function weightedWeiszfeld(points, weights, tol = 1e-9, maxIter = 500) {
-  const dim = points[0].length;
-  let y = Array(dim).fill(0);
-  const weightSum = weights.reduce((a, b) => a + b, 0);
-  for (let i = 0; i < points.length; i++) {
-    for (let d = 0; d < dim; d++) y[d] += points[i][d] * weights[i] / weightSum;
-  }
-  for (let iter = 0; iter < maxIter; iter++) {
-    const scaled = Array(dim).fill(0);
-    let denom = 0;
-    for (let i = 0; i < points.length; i++) {
-      const dist = Math.max(distance(points[i], y), 1e-12);
-      const w = weights[i] / dist;
-      denom += w;
-      for (let d = 0; d < dim; d++) scaled[d] += points[i][d] * w;
-    }
-    const yNew = scaled.map(x => x / denom);
-    if (distance(yNew, y) < tol) return yNew;
-    y = yNew;
-  }
-  return y;
-}
-
-function avgDist(point, points) {
-  return points.reduce((sum, p) => sum + distance(p, point), 0) / points.length;
-}
-
-function geserTitik(point, jarak) {
-  if (jarak === 0) return point.slice();
-  const arah = point.map(() => randNormal());
-  const norm = vectorNorm(arah);
-  if (norm < 1e-12) return point.slice();
-  return point.map((x, i) => x + (arah[i] / norm) * jarak);
-}
-
-function dippKeygenInt(aPoints, params) {
-  const x = Array.from({length: params.dim}, () => randInt(0, params.coord_max - 1));
-  const w = randUniform(params.w_range[0], params.w_range[1]);
-  const delta = Array.from({length: aPoints.length}, () => randUniform(params.delta_range[0], params.delta_range[1]));
-  const weights = delta.map(d => 1.0 + d).concat([w]);
-  const b = geserTitik(weightedWeiszfeld(aPoints.concat([x]), weights), params.error_geser);
-  return {x, w, delta, b};
-}
-
-function dippComputeF(aPoints, bPeer, xSelf, wSelf, deltaSelf) {
-  const weights = deltaSelf.map(d => 1.0 + d).concat([1.0, wSelf]);
-  const med = weightedWeiszfeld(aPoints.concat([bPeer, xSelf]), weights);
-  return avgDist(med, aPoints);
-}
-
-function bytesToBits(data) {
-  const bits = [];
-  for (const byte of data) {
-    for (let i = 7; i >= 0; i--) bits.push((byte >> i) & 1);
-  }
-  return bits;
-}
-
-function bitsToBytes(bits) {
-  if (bits.length % 8 !== 0) throw new Error("Jumlah bit DIPP tidak kelipatan 8.");
-  const out = new Uint8Array(bits.length / 8);
-  for (let i = 0; i < bits.length; i += 8) {
-    let byte = 0;
-    for (const bit of bits.slice(i, i + 8)) byte = (byte << 1) | bit;
-    out[i / 8] = byte;
-  }
-  return out;
-}
-
-function generateDippKeypair(params = DIPP_PARAMS) {
-  const aPoints = Array.from({length: params.n_pub}, () =>
-    Array.from({length: params.dim}, () => randInt(0, params.coord_max - 1))
-  );
-  const kg = dippKeygenInt(aPoints, params);
-  const publicKey = {
-    algorithm: DIPP_ALGORITHM_NAME,
-    version: DIPP_VERSION,
-    dim: params.dim,
-    n_pub: params.n_pub,
-    coord_max: params.coord_max,
-    w_range: params.w_range,
-    delta_range: params.delta_range,
-    q: params.q,
-    scale: params.scale,
-    error_bound: params.error_bound,
-    error_geser: params.error_geser,
-    dither_bound: params.dither_bound,
-    v_shift_bound: params.v_shift_bound,
-    repeat: params.repeat,
-    A_points: aPoints,
-    B: kg.b,
-  };
-  return {public: publicKey, private: {x: kg.x, w: kg.w, delta: kg.delta}};
+function rejectLegacyDippCall() {
+  throw new Error("DIPP legacy ditolak. Gunakan Ephemeral-R DIPP v1.");
 }
 
 async function generatePKIKeypair() {
@@ -1019,6 +875,10 @@ async function importRSAEnrollmentKey(
     expectedUsername = state.username
 ) {
 
+    if (!file || file.size > MAX_IDENTITY_FILE_BYTES) {
+        throw new Error("File RSA Login melebihi batas 1 MiB.");
+    }
+
     const text =
         await file.text();
 
@@ -1135,83 +995,8 @@ async function importRSAEnrollmentKey(
 }
 
 
-function dippWrapBytes(publicKey, keyBytes) {
-  const params = {
-    dim: publicKey.dim,
-    coord_max: publicKey.coord_max,
-    w_range: publicKey.w_range,
-    delta_range: publicKey.delta_range,
-    q: publicKey.q,
-    scale: publicKey.scale,
-    error_bound: publicKey.error_bound,
-    error_geser: publicKey.error_geser,
-    // Key versi 1 tidak mempunyai dua field ini; nilai nol menjaga perilaku lama.
-    dither_bound: Number.isFinite(publicKey.dither_bound)
-      ? publicKey.dither_bound
-      : 0,
-    v_shift_bound: Number.isFinite(publicKey.v_shift_bound)
-      ? publicKey.v_shift_bound
-      : 0,
-    repeat: publicKey.repeat,
-  };
-  const sender = dippKeygenInt(publicKey.A_points, params);
-  const fInt = positiveModulo(
-    Math.round(
-      dippComputeF(
-        publicKey.A_points,
-        publicKey.B,
-        sender.x,
-        sender.w,
-        sender.delta
-      ) * params.scale
-    ) + boundedIntegerNoise(params.dither_bound),
-    params.q
-  );
-  const vList = [];
-  for (const bit of bytesToBits(keyBytes)) {
-    for (let i = 0; i < params.repeat; i++) {
-      const error = boundedIntegerNoise(params.error_bound);
-      const vShift = boundedIntegerNoise(params.v_shift_bound);
-      vList.push(positiveModulo(
-        fInt + error + vShift + bit * Math.floor(params.q / 2),
-        params.q
-      ));
-    }
-  }
-  return {
-    algorithm: publicKey.algorithm || DIPP_ALGORITHM_NAME,
-    version: publicKey.version || DIPP_VERSION,
-    created: new Date().toISOString(),
-    n_bits: keyBytes.length * 8,
-    repeat: params.repeat,
-    q: params.q,
-    scale: params.scale,
-    dither_bound: params.dither_bound,
-    v_shift_bound: params.v_shift_bound,
-    B_s: sender.b,
-    V: vList,
-  };
-}
-
-function dippUnwrapBytes(privateEntry, wrapped) {
-  const pub = privateEntry.public;
-  const priv = privateEntry.private;
-  const fInt = Math.round(dippComputeF(pub.A_points, wrapped.B_s, priv.x, priv.w, priv.delta) * wrapped.scale) % wrapped.q;
-  if (wrapped.V.length !== wrapped.n_bits * wrapped.repeat) {
-    throw new Error("Paket kunci DIPP tidak konsisten.");
-  }
-  const bits = [];
-  for (let i = 0; i < wrapped.n_bits; i++) {
-    let votes = 0;
-    for (let j = 0; j < wrapped.repeat; j++) {
-      const v = wrapped.V[i * wrapped.repeat + j];
-      const diff = (v - fInt + wrapped.q) % wrapped.q;
-      votes += Math.round(diff / Math.floor(wrapped.q / 2)) % 2;
-    }
-    bits.push(votes * 2 > wrapped.repeat ? 1 : 0);
-  }
-  return bitsToBytes(bits);
-}
+function dippWrapBytes() { return rejectLegacyDippCall(); }
+function dippUnwrapBytes() { return rejectLegacyDippCall(); }
 
 async function exportPKIPublicKey() {
 
@@ -1244,129 +1029,63 @@ async function exportPKIPublicKey() {
 
 }
 
-async function exportDippIdentity(
-    username,
-    dipp
-) {
-
-    const identity = {
-
-        version: 1,
-
-        type: "ONE_MIND_DIPP",
-
-        username,
-
-        created_at:
-            new Date().toISOString(),
-
-        public_key:
-            dipp.public,
-
-        private_key:
-            dipp.private
-
-    };
-
-    const blob =
-        new Blob(
-
-            [
-                JSON.stringify(
-                    identity,
-                    null,
-                    2
-                )
-            ],
-
-            {
-                type:
-                    "application/json"
-            }
-
-        );
-
-    const url =
-        URL.createObjectURL(
-            blob
-        );
-
-    const a =
-        document.createElement(
-            "a"
-        );
-
-    a.href = url;
-
-    a.download =
-        `ONE_MIND_DIPP_${username}.dipp`;
-
-    a.click();
-
-    URL.revokeObjectURL(
-        url
-    );
-
+function dippVaultCacheKey(username) {
+  return `om_dipp_ephemeral_r_vault_${username}`;
 }
-async function importDippIdentity(
-    file,
-    username
-) {
 
-    const text =
-        await file.text();
+function downloadDippPackage(username, packageValue) {
+  downloadJson(`ONE_MIND_DIPP_EPHEMERAL_R_STANDALONE_${username}.dipp`, packageValue);
+}
 
-    const identity =
-        JSON.parse(text);
+async function persistCurrentDippVault() {
+  if (!dippSession.privateKey || !dippSession.username) return;
+  const sealed = await OneMindDippEphemeralR.sealIdentity(dippSession.privateKey);
+  localStorage.setItem(
+    dippVaultCacheKey(dippSession.username),
+    JSON.stringify(sealed)
+  );
+}
 
-    if (
-        identity.type !==
-        "ONE_MIND_DIPP"
-    ) {
+function activateDippIdentity(identity) {
+  dippSession.privateKey = identity;
+  dippSession.publicKey = identity.public;
+  dippSession.username = identity.username;
+  dippSession.runtime = null;
+  state.unlockedPrivateKey = identity;
+  updateLocalKeyStatus();
+  return identity;
+}
 
-        throw new Error(
-            "Bukan file Identitas DIPP ONE_MIND."
-        );
+async function exportDippIdentity(username, dipp) {
+  if (!dipp || dipp.username !== username) {
+    throw new Error("Vault DIPP aktif tidak cocok dengan user.");
+  }
+  const sealed = await OneMindDippEphemeralR.sealIdentity(dipp);
+  localStorage.setItem(dippVaultCacheKey(username), JSON.stringify(sealed));
+  downloadDippPackage(username, sealed);
+}
 
+async function importDippIdentity(file, username, password) {
+  if (!password) throw new Error("Password diperlukan untuk membuka vault DIPP.");
+  if (!file || file.size > MAX_IDENTITY_FILE_BYTES) throw new Error("File vault DIPP melebihi batas 1 MiB.");
+  const filePackage = JSON.parse(await file.text());
+  let identity = await OneMindDippEphemeralR.openIdentity(filePackage, username, password);
+
+  const cachedText = localStorage.getItem(dippVaultCacheKey(username));
+  if (cachedText) {
+    try {
+      const cachedPackage = JSON.parse(cachedText);
+      const samePublicIdentity = JSON.stringify(cachedPackage.public_key)
+        === JSON.stringify(filePackage.public_key);
+      if (samePublicIdentity) {
+        identity = await OneMindDippEphemeralR.openIdentity(cachedPackage, username, password);
+      }
+    } catch (error) {
+      console.warn("Cache vault DIPP terenkripsi tidak dapat dibuka; memakai file import.", error);
     }
+  }
 
-    if (
-        identity.username !==
-        username
-    ) {
-
-        throw new Error(
-            "Identitas bukan milik user ini."
-        );
-
-    }
-
-    const dipp = {
-
-        public:
-            identity.public_key,
-
-        private:
-            identity.private_key
-
-    };
-
-    dippSession.privateKey =
-        dipp;
-
-    dippSession.publicKey =
-        dipp.public;
-
-    dippSession.username =
-        username;
-
-    state.unlockedPrivateKey =
-        dipp;
-
-    updateLocalKeyStatus();
-
-    return dipp;
-
+  return activateDippIdentity(identity);
 }
 
 function hasLocalPrivateKey(username = state.username) {
@@ -1417,7 +1136,7 @@ function updateLocalKeyStatus() {
     if (!loaded) {
 
         status.textContent =
-            "Identitas DIPP belum diimport.";
+            "Vault DIPP Ephemeral-R belum dibuka.";
 
         status.className =
             "keyStatus missing";
@@ -1427,7 +1146,7 @@ function updateLocalKeyStatus() {
     else {
 
         status.textContent =
-            "Identitas DIPP berhasil dimuat ke RAM.";
+            "Vault DIPP Ephemeral-R terenkripsi berhasil dibuka; state aktif berada di RAM.";
 
         status.className =
             "keyStatus unlocked";
@@ -1447,14 +1166,57 @@ function downloadJson(filename, data) {
 }
 
 
-async function wrapFileKey(fileKey, recipientPublicKey) {
+async function wrapFileKey(fileKey, recipientPublicKey, fileContextId) {
+  if (!fileContextId) throw new Error("file_context_id diperlukan untuk pembungkus DIPP.");
+  const identity = await ensureUnlockedPrivateKey();
+  OneMindDippEphemeralR.validatePublicKey(recipientPublicKey);
+  if (!rsaEnrollmentSession.privateKey || rsaEnrollmentSession.username !== identity.username) {
+    throw new Error("RSA Login Key aktif diperlukan untuk menandatangani transcript Ephemeral-R.");
+  }
   const rawFileKey = new Uint8Array(await crypto.subtle.exportKey("raw", fileKey));
-  return dippWrapBytes(recipientPublicKey, rawFileKey);
+  try {
+    return await OneMindDippEphemeralR.wrapFileKey(recipientPublicKey, rawFileKey, {
+      file_context_id: fileContextId,
+      sender_id: identity.username,
+      recipient_id: recipientPublicKey.user_id,
+    }, async transcriptHash => new Uint8Array(await crypto.subtle.sign(
+      {name: "RSASSA-PKCS1-v1_5"},
+      rsaEnrollmentSession.privateKey,
+      transcriptHash
+    )));
+  } finally {
+    rawFileKey.fill(0);
+  }
 }
 
 async function unwrapFileKey(wrapped, privateKey) {
-  const raw = dippUnwrapBytes(privateKey, wrapped);
-  return crypto.subtle.importKey("raw", raw, {name: "AES-GCM"}, true, ["encrypt", "decrypt"]);
+  if (!privateKey) throw new Error("Vault DIPP Ephemeral-R belum dibuka.");
+  OneMindDippEphemeralR.validateEnvelope(wrapped);
+  const senderPki = await api(
+    `/api/users/${encodeURIComponent(wrapped.sender_id)}/pki-public-key`
+  );
+  const signingKey = await crypto.subtle.importKey(
+    "spki",
+    pemToArrayBuffer(senderPki.pki_public_key),
+    {name: "RSASSA-PKCS1-v1_5", hash: PKI_HASH},
+    false,
+    ["verify"]
+  );
+  const raw = await OneMindDippEphemeralR.unwrapFileKey(
+    privateKey,
+    wrapped,
+    (hash, signature) => crypto.subtle.verify(
+      {name: "RSASSA-PKCS1-v1_5"},
+      signingKey,
+      signature,
+      hash
+    )
+  );
+  try {
+    return await crypto.subtle.importKey("raw", raw, {name: "AES-GCM"}, true, ["encrypt", "decrypt"]);
+  } finally {
+    raw.fill(0);
+  }
 }
 
 async function encryptBlob(blob, fileName, mimeType, key = null) {
@@ -1519,6 +1281,12 @@ async function encryptBlob(blob, fileName, mimeType, key = null) {
             version: 2,
 
             algorithm: "AES-256-GCM",
+
+            protocol_version: "ONE_MIND_DIPP_EPHEMERAL_R_WEIGHTED_V2",
+
+            file_context_id: OneMindDippEphemeralR.b64url(
+                crypto.getRandomValues(new Uint8Array(24))
+            ),
 
             filename: fileName,
 
@@ -1844,13 +1612,13 @@ async function getFileKey(fileId) {
 
 }
 
-async function wrapKeyForAccess(fileKey, fileId) {
+async function wrapKeyForAccess(fileKey, fileId, fileContextId) {
   const access = await api(`/api/files/${fileId}/access`);
   const wrapped_keys = [];
   for (const entry of access) {
     wrapped_keys.push({
       recipient: entry.username,
-      wrapped_key: await wrapFileKey(fileKey, entry.public_key),
+      wrapped_key: await wrapFileKey(fileKey, entry.public_key, fileContextId),
     });
   }
   return wrapped_keys;
@@ -1901,6 +1669,9 @@ async function updateFileWithRotation(fileId, replacementFile) {
 
     if (!replacementFile || !replacementFile.size)
         return;
+    if (replacementFile.size + 16 > MAX_INLINE_UPDATE_BYTES) {
+        throw new Error("Update langsung dibatasi 128 MiB. Upload sebagai file baru untuk ukuran lebih besar.");
+    }
 
     const current = await getFileKey(fileId);
 
@@ -1931,7 +1702,8 @@ async function updateFileWithRotation(fileId, replacementFile) {
     const wrapped_keys =
         await wrapKeyForAccess(
             encrypted.key,
-            fileId
+            fileId,
+            encrypted.envelope.file_context_id
         );
 
     await api(
@@ -1956,6 +1728,10 @@ async function rotateCurrentFileKey(fileId) {
     const current = await getFileKey(fileId);
 
     const currentCiphertext = await fetchCiphertextChunks(current.file);
+
+    if (currentCiphertext.length > MAX_INLINE_UPDATE_BYTES) {
+        throw new Error("Rotasi langsung dibatasi 128 MiB. Gunakan upload ulang untuk file lebih besar.");
+    }
 
     const blob = await decryptEnvelope(
         current.file.envelope,
@@ -1997,7 +1773,8 @@ async function rotateCurrentFileKey(fileId) {
 
     const wrapped_keys = await wrapKeyForAccess(
         encrypted.key,
-        fileId
+        fileId,
+        encrypted.envelope.file_context_id
     );
 
     await api(
@@ -2911,10 +2688,10 @@ on("registerForm", "submit", async (evt) => {
     const password = form.get("password");
 
     // ============================
-    // Generate DIPP Keypair
+    // Generate encrypted DIPP Ephemeral-R identity vault
     // ============================
 
-    const dipp = generateDippKeypair();
+    const dipp = await OneMindDippEphemeralR.generateIdentity(username, password);
 
     // ============================
     // Generate RSA Login Keypair
@@ -2971,13 +2748,7 @@ on("registerForm", "submit", async (evt) => {
     // Simpan DIPP Session
     // ============================
 
-    dippSession.privateKey = dipp;
-
-    dippSession.publicKey = dipp.public;
-
-    dippSession.username = username;
-
-    state.unlockedPrivateKey = dipp;
+    activateDippIdentity(dipp);
 
     // ============================
     // Simpan RSA Login Session
@@ -3098,7 +2869,8 @@ on("importDippInput", "change", async (evt) => {
 
         await importDippIdentity(
             file,
-            state.username
+            state.username,
+            $("dippVaultPassword")?.value
         );
 
         showNotice(
@@ -3116,7 +2888,19 @@ on("importDippInput", "change", async (evt) => {
     }
 
     input.value = "";
+    if ($("dippVaultPassword")) $("dippVaultPassword").value = "";
 
+});
+
+on("exportDippBtn", "click", async () => {
+    try {
+        const identity = await ensureUnlockedPrivateKey();
+        await exportDippIdentity(state.username, identity);
+        showNotice("Vault DIPP Ephemeral-R terbaru berhasil diekspor dalam keadaan terenkripsi.");
+    } catch (err) {
+        console.error(err);
+        handleUiError(err, {context: "keyExport"});
+    }
 });
 
 on("loginForm", "submit", async (evt) => {
@@ -3141,7 +2925,8 @@ on("loginForm", "submit", async (evt) => {
         // DIPP tetap menjadi identitas untuk seluruh operasi di aplikasi.
         await importDippIdentity(
             selectedDippFile,
-            username
+            username,
+            password
         );
 
         // Tahap password: server hanya memberi token login sementara.
@@ -3220,6 +3005,7 @@ on("loginForm", "submit", async (evt) => {
         dippSession.privateKey = null;
         dippSession.publicKey = null;
         dippSession.username = null;
+        dippSession.runtime = null;
 
         rsaEnrollmentSession.privateKey = null;
         rsaEnrollmentSession.publicKey = null;
@@ -3260,6 +3046,9 @@ on("uploadForm", "submit", async (evt) => {
         if (!file || !file.size) {
             return;
         }
+        if (file.size + 16 > MAX_FILE_BYTES) {
+            throw new Error("Ukuran file melebihi batas 20 GiB.");
+        }
 
         form.setAttribute("aria-busy", "true");
         if (submitButton) submitButton.disabled = true;
@@ -3275,7 +3064,8 @@ on("uploadForm", "submit", async (evt) => {
 
         const wrapped = await wrapFileKey(
             encrypted.key,
-            me.public_key
+            me.public_key,
+            encrypted.envelope.file_context_id
         );
 
         setUploadProgress("Membuat sesi upload terenkripsi...");
@@ -3329,13 +3119,13 @@ on("shareForm", "submit", async (evt) => {
   const fileId = form.get("file_id");
   const recipient = form.get("recipient");
   const permission = form.get("permission");
-  const {fileKey} = await getFileKey(fileId);
+  const {file, fileKey} = await getFileKey(fileId);
   const recipientUser = await api(`/api/users/${encodeURIComponent(recipient)}/public-key`);
-  const wrapped = await wrapFileKey(fileKey, recipientUser.public_key);
+  const wrapped = await wrapFileKey(fileKey, recipientUser.public_key, file.envelope.file_context_id);
   await api("/api/share", {method: "POST", body: JSON.stringify({file_id: fileId, recipient, permission, wrapped_key: wrapped})});
   await refreshAll();
   await renderAccess(fileId);
-  showNotice("Public key penerima diambil, shared secret file dibungkus, dan akses berhasil disimpan.");
+  showNotice("Public key penerima diambil, pre-key DIPP dibentuk ulang oleh penerima, dan AES file key berhasil dibungkus.");
 });
 
 on("fileList", "click", async (evt) => {
@@ -3445,9 +3235,9 @@ on("incomingRequestList", "click", async (evt) => {
       const request = (state.fileRequests?.incoming || []).find(item => item.id === requestId);
       if (!request) throw new Error("Permintaan tidak ditemukan. Muat ulang halaman.");
 
-      const {fileKey} = await getFileKey(request.file_id);
+      const {file, fileKey} = await getFileKey(request.file_id);
       const requester = await api(`/api/users/${encodeURIComponent(request.requester)}/public-key`);
-      const wrappedKey = await wrapFileKey(fileKey, requester.public_key);
+      const wrappedKey = await wrapFileKey(fileKey, requester.public_key, file.envelope.file_context_id);
       await api(`/api/file-requests/${requestId}/approve`, {
         method: "POST",
         body: JSON.stringify({wrapped_key: wrappedKey}),
@@ -3583,6 +3373,7 @@ on("logoutBtn", "click", () => {
   dippSession.privateKey = null;
   dippSession.publicKey = null;
   dippSession.username = null;
+  dippSession.runtime = null;
 
   // ============================
   // Hapus PKI dari RAM

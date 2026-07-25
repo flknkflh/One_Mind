@@ -1,7 +1,9 @@
+name: one-mind-dipp
+
 services:
   one-mind:
     build: .
-    container_name: one_mind
+    container_name: one_mind_dipp
     expose:
       - "8080"
     environment:
@@ -9,36 +11,39 @@ services:
       ONE_MIND_HOST: 0.0.0.0
       ONE_MIND_PORT: 8080
       ONE_MIND_TLS_MODE: off
+      ONE_MIND_CRYPTO_PROFILE: ONE_MIND_DIPP_EPHEMERAL_R_WEIGHTED_V2
       ONE_MIND_ALLOWED_HOSTS: ${ONE_MIND_ALLOWED_HOSTS}
       ONE_MIND_PKI_AUTO_INIT: ${ONE_MIND_PKI_AUTO_INIT:-false}
-      ONE_MIND_SESSION_SECONDS: ${ONE_MIND_SESSION_SECONDS:-43200}
+      ONE_MIND_SESSION_SECONDS: ${ONE_MIND_SESSION_SECONDS:-300}
+      ONE_MIND_ADMIN_SESSION_SECONDS: ${ONE_MIND_ADMIN_SESSION_SECONDS:-300}
+      ONE_MIND_PENDING_LOGIN_SECONDS: ${ONE_MIND_PENDING_LOGIN_SECONDS:-300}
       ONE_MIND_LOGIN_MAX_FAILURES: ${ONE_MIND_LOGIN_MAX_FAILURES:-8}
       ONE_MIND_LOGIN_WINDOW_SECONDS: ${ONE_MIND_LOGIN_WINDOW_SECONDS:-600}
       ONE_MIND_ARGON2_TIME_COST: ${ONE_MIND_ARGON2_TIME_COST:-3}
       ONE_MIND_ARGON2_MEMORY_KIB: ${ONE_MIND_ARGON2_MEMORY_KIB:-65536}
       ONE_MIND_ARGON2_PARALLELISM: ${ONE_MIND_ARGON2_PARALLELISM:-4}
     volumes:
-      - one_mind_data:/app/data
+      - one_mind_dipp_data:/app/data
     restart: unless-stopped
 
   caddy:
     image: caddy:2.8-alpine
-    container_name: one_mind_caddy
+    container_name: one_mind_dipp_caddy
     depends_on:
       - one-mind
     ports:
-      - "80:80"
-      - "443:443"
+      - "${ONE_MIND_HTTP_PORT:-8081}:80"
+      - "${ONE_MIND_HTTPS_PORT:-8444}:443"
     environment:
       ONE_MIND_DOMAIN: ${ONE_MIND_DOMAIN}
       LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
+      - one_mind_dipp_caddy_data:/data
+      - one_mind_dipp_caddy_config:/config
     restart: unless-stopped
 
 volumes:
-  one_mind_data:
-  caddy_data:
-  caddy_config:
+  one_mind_dipp_data:
+  one_mind_dipp_caddy_data:
+  one_mind_dipp_caddy_config:

@@ -8,6 +8,7 @@
 # Runtime application data
 data/
 runtime/
+tmp/
 certs/
 app/pki/root/
 app/pki/intermediate/
@@ -70,3 +71,4 @@ coverage.xml
 junit.xml
 reports/
 tools/backup/
+backups/

@@ -9,13 +9,17 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import HTTPException
 
 from app import main
+from tests.dipp_helpers import b64url, make_user_material, wrapped_key
 
 
 class ChunkDownloadTests(unittest.TestCase):
     def setUp(self):
         self.conn = main.db()
         self._clear_runtime()
+        self.materials = {}
         for username in ("alice", "bob", "charlie"):
+            public_identity, signing_private, signing_public_pem = make_user_material(username)
+            self.materials[username] = (public_identity, signing_private)
             self.conn.execute(
                 """
                 INSERT INTO users (
@@ -31,8 +35,8 @@ class ChunkDownloadTests(unittest.TestCase):
                     f"NIP-{username}",
                     "TEST",
                     "TEST",
-                    json.dumps({"algorithm": "DIPP-TEST", "username": username}),
-                    "PUBLIC-KEY-PLACEHOLDER",
+                    json.dumps(public_identity),
+                    signing_public_pem,
                     main.now_iso(),
                 ),
             )
@@ -43,6 +47,7 @@ class ChunkDownloadTests(unittest.TestCase):
         self.conn.close()
 
     def _clear_runtime(self):
+        self.conn.execute("DELETE FROM dipp_ciphertexts")
         self.conn.execute("DELETE FROM file_requests")
         self.conn.execute("DELETE FROM shares")
         self.conn.execute("DELETE FROM files")
@@ -58,16 +63,33 @@ class ChunkDownloadTests(unittest.TestCase):
         main.STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         main.TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+    def dipp_wrapped_key(
+        self,
+        receiver: str,
+        marker: str = "test",
+        file_context_id: str | None = None,
+    ) -> dict:
+        recipient_public = self.materials[receiver][0]
+        sender_private = self.materials["alice"][1]
+        return wrapped_key(
+            "alice", receiver, recipient_public, sender_private, marker, file_context_id
+        )
+
     @staticmethod
-    def encrypted_payload(plaintext: bytes):
+    def encrypted_payload(plaintext: bytes, filename: str = "besar.bin"):
         key = AESGCM.generate_key(bit_length=256)
         iv = bytes(range(12))
-        aad = b'{"filename":"besar.bin","type":"application/octet-stream"}'
+        aad = json.dumps(
+            {"filename": filename, "type": "application/octet-stream"},
+            separators=(",", ":"),
+        ).encode("utf-8")
         ciphertext = AESGCM(key).encrypt(iv, plaintext, aad)
         envelope = {
             "version": 2,
             "algorithm": "AES-256-GCM",
-            "filename": "besar.bin",
+            "protocol_version": main.DIPP_FILE_PROTOCOL_VERSION,
+            "file_context_id": b64url(hashlib.sha256(plaintext).digest()[:24]),
+            "filename": filename,
             "mime": "application/octet-stream",
             "aad_b64": base64.b64encode(aad).decode("ascii"),
             "iv_b64": base64.b64encode(iv).decode("ascii"),
@@ -113,7 +135,9 @@ class ChunkDownloadTests(unittest.TestCase):
             main.UploadFinishIn(
                 upload_id=session["upload_id"],
                 envelope=envelope,
-                wrapped_key_for_owner={"wrapped": "owner-key"},
+                wrapped_key_for_owner=self.dipp_wrapped_key(
+                    "alice", "owner", envelope["file_context_id"]
+                ),
                 ciphertext_sha256=hash_override or digest,
                 is_hidden=True,
             ),
@@ -171,7 +195,9 @@ class ChunkDownloadTests(unittest.TestCase):
             main.ShareIn(
                 file_id=file_id,
                 recipient="bob",
-                wrapped_key={"wrapped": "bob-key"},
+                wrapped_key=self.dipp_wrapped_key(
+                    "bob", "bob", envelope["file_context_id"]
+                ),
                 permission="viewer",
             ),
             username="alice",
@@ -211,8 +237,12 @@ class ChunkDownloadTests(unittest.TestCase):
                 main.UploadFinishIn(
                     upload_id=session["upload_id"],
                     envelope=envelope,
-                    wrapped_key_for_owner={"wrapped": "owner-key"},
-                    ciphertext_sha256="invalid",
+                    wrapped_key_for_owner=self.dipp_wrapped_key(
+                        "alice", "owner-retry", envelope["file_context_id"]
+                    ),
+                    ciphertext_sha256=base64.b64encode(
+                        hashlib.sha256(ciphertext).digest()
+                    ).decode("ascii"),
                 ),
                 username="alice",
             )
@@ -233,7 +263,8 @@ class ChunkDownloadTests(unittest.TestCase):
 
         replacement_plaintext = b"versi-pengganti" * 30
         replacement_key, replacement, replacement_envelope = self.encrypted_payload(
-            replacement_plaintext
+            replacement_plaintext,
+            "pengganti.bin",
         )
         replacement_envelope["file_id"] = file_id
         replacement_envelope["version"] = 2
@@ -248,7 +279,9 @@ class ChunkDownloadTests(unittest.TestCase):
                 wrapped_keys=[
                     main.WrappedKeyIn(
                         recipient="alice",
-                        wrapped_key={"wrapped": "owner-key-v2"},
+                        wrapped_key=self.dipp_wrapped_key(
+                            "alice", "owner-v2", replacement_envelope["file_context_id"]
+                        ),
                     )
                 ],
             ),
