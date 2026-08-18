@@ -18,13 +18,21 @@ function bitsFromBytes(bytes) {
 
 (async () => {
   assert.strictEqual(D.PROTOCOL, "ONE_MIND_DIPP_EPHEMERAL_R_STANDALONE");
+  assert.strictEqual(D.PROTOCOL_VERSION, 5);
+  assert.strictEqual(
+    D.ENVELOPE_VERSION,
+    "ONE_MIND-DIPP-EPHEMERAL-R-WEIGHTED-E2048-R10S12S-Q2500K-v5"
+  );
+  assert.strictEqual(D.PARAMS.id, "ER-DIPP-64-16-W8-E2048-R10S12S-Q2500K-v5");
+  assert.strictEqual(D.PARAMS.secretRadiusMinPermille, 10000);
+  assert.strictEqual(D.PARAMS.secretRadiusMaxPermille, 12000);
+  assert.strictEqual(D.PARAMS.quantizationScale, 2500000);
   assert.strictEqual(D.PARAMS.dimension, 64);
   assert.strictEqual(D.PARAMS.publicPointCount, 16);
   assert.strictEqual(D.PARAMS.modulus, 65536);
   assert.strictEqual(D.PARAMS.preKeyBits, 256);
   assert.strictEqual(D.PARAMS.secretPointWeight, 8);
-  assert.strictEqual(D.PARAMS.secretRadiusMinPermille, 2000);
-  assert.strictEqual(D.PARAMS.secretRadiusMaxPermille, 4000);
+  assert.strictEqual(D.PARAMS.integerNoiseBound, 2048);
 
   assert.strictEqual(
     hex(D.shake256(new Uint8Array(), 64)),
@@ -42,13 +50,21 @@ function bitsFromBytes(bytes) {
   const bob = await D.generateIdentity("bob", "bob-password-kuat");
   D.validatePublicKey(alice.public, "alice");
   D.validatePublicKey(bob.public, "bob");
+  assert.throws(
+    () => D.validatePublicKey({...bob.public, unexpected: "not-allowed"}, "bob"),
+    /Public key bukan/
+  );
   assert.strictEqual("bob_private_point" in bob.public, false);
   assert.strictEqual("public_jwk" in bob.public, false);
   assert.strictEqual("pairing_curve" in bob.public, false);
-  assert.strictEqual(D.VAULT_VERSION, 8);
+  assert.strictEqual(D.VAULT_VERSION, 11);
 
   const opened = await D.openIdentity(bob.sealed, "bob", "bob-password-kuat");
   assert.strictEqual(opened.public.key_id, bob.public.key_id);
+  await assert.rejects(
+    D.openIdentity({...bob.sealed, unexpected: "not-allowed"}, "bob", "bob-password-kuat"),
+    /Vault DIPP lama ditolak/
+  );
   await assert.rejects(
     D.openIdentity(bob.sealed, "bob", "password-salah"),
     /Password salah/
@@ -79,12 +95,16 @@ function bitsFromBytes(bytes) {
 
   const first = await D.wrapFileKey(bob.public, fileKey, metadata, signer);
   D.validateEnvelope(first);
+  assert.throws(
+    () => D.validateEnvelope({...first, session_id: "<script>alert(1)</script>"}),
+    /canonical/
+  );
   assert.strictEqual(first.dipp_components.length, 256);
   assert.strictEqual(first.recipient_key_id, bob.public.key_id);
   assert.strictEqual(first.public_seed, bob.public.public_seed);
   assert.strictEqual(first.B_b, bob.public.B_b);
-  assert.strictEqual(first.key_establishment_algorithm, "DIPP-ER-WEIGHTED-v2");
-  assert.strictEqual(first.algorithms.geometry, "FIXED-WEISZFELD-24-WEIGHTED-8");
+  assert.strictEqual(first.key_establishment_algorithm, "DIPP-ER-WEIGHTED-E2048-R10S12S-Q2500K-v5");
+  assert.strictEqual(first.algorithms.geometry, "FIXED-WEISZFELD-24-WEIGHTED-8-R10S12S");
   assert.strictEqual(first.wrap_algorithm, "AES-256-GCM");
   assert.strictEqual(D.fromB64url(first.wrap_nonce).length, 12);
   assert.strictEqual(D.fromB64url(first.wrapped_file_key).length, 48);
@@ -174,7 +194,7 @@ function bitsFromBytes(bytes) {
   );
 
   console.log(
-    `DIPP Ephemeral-R weighted v2 lulus; raw V threshold accuracy=${rawThresholdAccuracy.toFixed(4)}.`
+    `DIPP Ephemeral-R weighted E2048 R10S12S Q2500K v5 lulus; raw V threshold accuracy=${rawThresholdAccuracy.toFixed(4)}.`
   );
 })().catch(error => {
   console.error(error);

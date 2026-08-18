@@ -6,26 +6,26 @@
   const dec = new TextDecoder();
   const MASK_64 = (1n << 64n) - 1n;
   const PROTOCOL = "ONE_MIND_DIPP_EPHEMERAL_R_STANDALONE";
-  const PROTOCOL_VERSION = 2;
-  const ENVELOPE_VERSION = "ONE_MIND-DIPP-EPHEMERAL-R-WEIGHTED-v2";
+  const PROTOCOL_VERSION = 5;
+  const ENVELOPE_VERSION = "ONE_MIND-DIPP-EPHEMERAL-R-WEIGHTED-E2048-R10S12S-Q2500K-v5";
   const VAULT_TYPE = "ONE_MIND_DIPP_EPHEMERAL_R_IDENTITY";
-  const VAULT_VERSION = 8;
-  const GEOMETRY_PROFILE = "FIXED-WEISZFELD-24-WEIGHTED-8";
-  const KEY_ESTABLISHMENT = "DIPP-ER-WEIGHTED-v2";
+  const VAULT_VERSION = 11;
+  const GEOMETRY_PROFILE = "FIXED-WEISZFELD-24-WEIGHTED-8-R10S12S";
+  const KEY_ESTABLISHMENT = "DIPP-ER-WEIGHTED-E2048-R10S12S-Q2500K-v5";
   const PARAMS = Object.freeze({
-    id: "ER-DIPP-64-16-W8-v2",
+    id: "ER-DIPP-64-16-W8-E2048-R10S12S-Q2500K-v5",
     dimension: 64,
     publicPointCount: 16,
     coordinateRange: 1000000,
     fixedPointScale: 1000000,
     secretPointWeight: 8,
-    secretRadiusMinPermille: 2000,
-    secretRadiusMaxPermille: 4000,
+    secretRadiusMinPermille: 10000,
+    secretRadiusMaxPermille: 12000,
     geometricNoiseNumerator: 0,
     geometricNoiseDenominator: 100,
     modulus: 65536,
-    quantizationScale: 1000000,
-    integerNoiseBound: 64,
+    quantizationScale: 2500000,
+    integerNoiseBound: 2048,
     preKeyBits: 256,
     maxCoordinateAbs: 34000000,
     solverIterations: 24,
@@ -91,6 +91,19 @@
   }
 
   function encodeCanonical(value) { return utf8(JSON.stringify(canonicalize(value))); }
+  function hasExactKeys(value, required) {
+    return Boolean(value)
+      && typeof value === "object"
+      && !Array.isArray(value)
+      && Object.keys(value).length === required.length
+      && required.every(key => Object.prototype.hasOwnProperty.call(value, key));
+  }
+  function validUsername(value) { return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{2,79}$/.test(value); }
+  function validIsoTimestamp(value) {
+    if (typeof value !== "string" || value.length > 64) return false;
+    const parsed = new Date(value);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+  }
   async function sha256(data) { requireCrypto(); return new Uint8Array(await subtle.digest("SHA-256", data)); }
 
   async function hkdf(ikm, salt, info, length = 32) {
@@ -199,7 +212,8 @@
   function bytesFromBits(bits){if(bits.length!==PARAMS.preKeyBits||bits.length%8)throw new Error("Jumlah bit pre-key tidak valid.");const out=new Uint8Array(bits.length/8);for(let i=0;i<bits.length;i++){out[Math.floor(i/8)]|=bits[i]<<(7-(i%8));}return out;}
 
   function validatePublicKey(publicKey,expectedUser=null){
-    if(!publicKey||publicKey.protocol!==PROTOCOL||publicKey.version!==PROTOCOL_VERSION||publicKey.type!=="ONE_MIND_DIPP_EPHEMERAL_R_STANDALONE_PUBLIC"||publicKey.parameter_profile!==PARAMS.id)throw new Error("Public key bukan Ephemeral-R DIPP standalone v1.");
+    const required=["protocol","version","type","user_id","key_id","parameter_profile","public_seed","B_b"];
+    if(!hasExactKeys(publicKey,required)||publicKey.protocol!==PROTOCOL||publicKey.version!==PROTOCOL_VERSION||publicKey.type!=="ONE_MIND_DIPP_EPHEMERAL_R_STANDALONE_PUBLIC"||publicKey.parameter_profile!==PARAMS.id||!validUsername(publicKey.user_id))throw new Error("Public key bukan Ephemeral-R DIPP standalone v5.");
     if(expectedUser&&publicKey.user_id!==expectedUser)throw new Error("Public key Ephemeral-R milik user berbeda.");
     if(fromB64url(publicKey.public_seed).length!==32||fromB64url(publicKey.B_b).length!==PARAMS.dimension*4||!/^[0-9a-f]{64}$/.test(publicKey.key_id))throw new Error("Public key Ephemeral-R tidak canonical.");
     decodeSignedVector(publicKey.B_b);
@@ -211,7 +225,7 @@
     const pB=geometricMedian(points.concat(weightedPoint(xB)));
     const noiseRadius=scaleValue*BigInt(PARAMS.geometricNoiseNumerator)/BigInt(PARAMS.geometricNoiseDenominator);
     const eta=boundedNoise(noiseRadius),bB=pB.map((v,i)=>v+eta[i]);
-    const keyId=bytesToHex(await sha256(concatBytes(utf8("DIPP-ER-WEIGHTED-KEY-ID-v2"),utf8(username),publicSeed,encodeSignedVector(bB))));
+    const keyId=bytesToHex(await sha256(concatBytes(utf8("DIPP-ER-WEIGHTED-E2048-R10S12S-Q2500K-KEY-ID-v5"),utf8(username),publicSeed,encodeSignedVector(bB))));
     eta.fill(0);
     return {publicSeed,xB,bB,keyId};
   }
@@ -235,13 +249,14 @@
     return runtime.sealed={...header,vault:{algorithm:"AES-256-GCM",nonce:b64url(iv),ciphertext:b64url(ciphertext)}};
   }
   async function openIdentity(packageValue,username,password){
-    if(!packageValue||packageValue.type!==VAULT_TYPE||packageValue.version!==VAULT_VERSION)throw new Error("Vault DIPP lama ditolak; gunakan Ephemeral-R weighted vault v8.");
+    const required=["version","type","user_id","created_at","public_key","kdf","vault"];
+    if(!hasExactKeys(packageValue,required)||packageValue.type!==VAULT_TYPE||packageValue.version!==VAULT_VERSION||!validUsername(packageValue.user_id)||!validIsoTimestamp(packageValue.created_at))throw new Error("Vault DIPP lama ditolak; gunakan Ephemeral-R weighted E2048 R10S12S Q2500K vault v11.");
     if(packageValue.user_id!==username)throw new Error("Vault DIPP milik user berbeda.");validatePublicKey(packageValue.public_key,username);
-    if(packageValue.kdf?.name!=="PBKDF2-SHA-256"||packageValue.kdf.iterations<600000||packageValue.vault?.algorithm!=="AES-256-GCM")throw new Error("Parameter vault tidak valid.");
+    if(!hasExactKeys(packageValue.kdf,["name","iterations","salt"])||!hasExactKeys(packageValue.vault,["algorithm","nonce","ciphertext"])||packageValue.kdf.name!=="PBKDF2-SHA-256"||!Number.isSafeInteger(packageValue.kdf.iterations)||packageValue.kdf.iterations!==600000||fromB64url(packageValue.kdf.salt).length!==16||packageValue.vault.algorithm!=="AES-256-GCM"||fromB64url(packageValue.vault.nonce).length!==12||fromB64url(packageValue.vault.ciphertext).length<17)throw new Error("Parameter vault tidak valid.");
     const header={version:packageValue.version,type:packageValue.type,user_id:packageValue.user_id,created_at:packageValue.created_at,public_key:packageValue.public_key,kdf:packageValue.kdf};
     const key=await deriveVaultKey(password,fromB64url(packageValue.kdf.salt),packageValue.kdf.iterations);let plaintext;
     try{plaintext=await subtle.decrypt({name:"AES-GCM",iv:fromB64url(packageValue.vault.nonce),additionalData:encodeCanonical(header)},key,fromB64url(packageValue.vault.ciphertext));}catch(error){throw new Error("Password salah atau vault Ephemeral-R berubah.");}
-    const privateState=JSON.parse(dec.decode(plaintext));if(!privateState.bob_private_point)throw new Error("Private state Ephemeral-R tidak lengkap.");decodeSignedVector(privateState.bob_private_point);
+    const privateState=JSON.parse(dec.decode(plaintext));if(!hasExactKeys(privateState,["bob_private_point"])||!privateState.bob_private_point)throw new Error("Private state Ephemeral-R tidak lengkap.");decodeSignedVector(privateState.bob_private_point);
     return {public:packageValue.public_key,private:privateState,username,createdAt:packageValue.created_at,vaultKey:key,kdf:packageValue.kdf,sealed:packageValue};
   }
 
@@ -252,7 +267,7 @@
     const preKey=randomBytes(32),bits=bitsFromBytes(preKey),components=[],noiseRadius=scaleValue*BigInt(PARAMS.geometricNoiseNumerator)/BigInt(PARAMS.geometricNoiseDenominator);
     for(const bit of bits){const r=secretPoint(center,scaleValue),p=geometricMedian(points.concat(weightedPoint(r))),eta=boundedNoise(noiseRadius),u=p.map((v,i)=>v+eta[i]),cross=geometricMedian(points.concat(weightedPoint(r),weightedPoint(bB))),k=normalizedFunctionalQuantized(cross,points,scaleValue),e=randomInt(-PARAMS.integerNoiseBound,PARAMS.integerNoiseBound),v=mod(k+bit*(PARAMS.modulus/2)+e);components.push({U:b64url(encodeSignedVector(u)),V:v});r.fill(0);p.fill(0);eta.fill(0);cross.fill(0);}
     const transcript=transcriptObject(publicKey,components,metadata),transcriptHash=await sha256(encodeCanonical(transcript));
-    const dippKey=await hkdf(preKey,transcriptHash,utf8("ONE_MIND-DIPP-EPHEMERAL-R-WEIGHTED-v2"),32);preKey.fill(0);
+    const dippKey=await hkdf(preKey,transcriptHash,utf8(ENVELOPE_VERSION),32);preKey.fill(0);
     return {components,transcript,transcriptHash,dippKey};
   }
 
@@ -262,16 +277,17 @@
     const transcript=transcriptObject(runtime.public,wrapped.dipp_components,wrapped),hash=await sha256(encodeCanonical(transcript));if(wrapped.transcript_hash!==b64url(hash))throw new Error("Transcript Ephemeral-R berubah.");
     const points=derivePublicPoints(fromB64url(runtime.public.public_seed)),center=geometricMedian(points),scaleValue=publicScale(points,center),xB=decodeSignedVector(runtime.private.bob_private_point),bits=[];
     for(const component of wrapped.dipp_components){const u=decodeSignedVector(component.U),cross=geometricMedian(points.concat(weightedPoint(xB),weightedPoint(u))),k=normalizedFunctionalQuantized(cross,points,scaleValue),residual=mod(component.V-k),d0=Math.min(residual,PARAMS.modulus-residual),half=PARAMS.modulus/2,d1=Math.abs(residual-half);bits.push(d1<d0?1:0);cross.fill(0);u.fill(0);}
-    const preKey=bytesFromBits(bits),dippKey=await hkdf(preKey,hash,utf8("ONE_MIND-DIPP-EPHEMERAL-R-WEIGHTED-v2"),32);preKey.fill(0);xB.fill(0);return {dippKey,transcriptHash:hash};
+    const preKey=bytesFromBits(bits),dippKey=await hkdf(preKey,hash,utf8(ENVELOPE_VERSION),32);preKey.fill(0);xB.fill(0);return {dippKey,transcriptHash:hash};
   }
 
   function validateEnvelope(value){
     const required=["version","parameter_profile","sender_id","recipient_id","recipient_key_id","public_seed","B_b","session_id","file_context_id","dipp_components","algorithms","transcript_hash","key_establishment_algorithm","wrap_algorithm","wrap_nonce","wrapped_file_key","sender_signature_algorithm","sender_signature"];
     if(!value||typeof value!=="object"||Object.keys(value).length!==required.length||required.some(field=>!Object.prototype.hasOwnProperty.call(value,field)))throw new Error("Schema envelope Ephemeral-R tidak canonical.");
-    if(!value||typeof value!=="object"||value.version!==ENVELOPE_VERSION||value.parameter_profile!==PARAMS.id||value.key_establishment_algorithm!==KEY_ESTABLISHMENT||value.wrap_algorithm!=="AES-256-GCM")throw new Error("Wrapped key bukan Ephemeral-R DIPP weighted v2.");
+    if(!value||typeof value!=="object"||value.version!==ENVELOPE_VERSION||value.parameter_profile!==PARAMS.id||value.key_establishment_algorithm!==KEY_ESTABLISHMENT||value.wrap_algorithm!=="AES-256-GCM")throw new Error("Wrapped key bukan Ephemeral-R DIPP weighted E2048 R10S12S Q2500K v5.");
     if(!Array.isArray(value.dipp_components)||value.dipp_components.length!==PARAMS.preKeyBits)throw new Error("Jumlah component Ephemeral-R harus 256.");
     const seen=new Set();for(const component of value.dipp_components){if(!component||!Number.isSafeInteger(component.V)||component.V<0||component.V>=PARAMS.modulus)throw new Error("V_i Ephemeral-R di luar Z_q.");decodeSignedVector(component.U);const fingerprint=`${component.U}:${component.V}`;if(seen.has(fingerprint))throw new Error("Ciphertext component Ephemeral-R duplikat.");seen.add(fingerprint);}
     for(const field of ["sender_id","recipient_id","recipient_key_id","public_seed","B_b","session_id","file_context_id","transcript_hash","wrap_nonce","wrapped_file_key","sender_signature"]){if(typeof value[field]!=="string"||!value[field])throw new Error(`Field ${field} Ephemeral-R tidak valid.`);}
+    if(!validUsername(value.sender_id)||!validUsername(value.recipient_id)||fromB64url(value.session_id).length!==24||fromB64url(value.file_context_id).length!==24)throw new Error("Binding identity/session Ephemeral-R tidak canonical.");
     if(value.sender_signature_algorithm!=="RSA-PKCS1-v1_5-SHA512"||value.algorithms?.geometry!==GEOMETRY_PROFILE||value.algorithms?.extractor!=="HKDF-SHA-256"||value.algorithms?.key_establishment!==KEY_ESTABLISHMENT||Object.keys(value.algorithms).length!==3)throw new Error("Suite algoritme Ephemeral-R tidak valid.");
     if(!/^[0-9a-f]{64}$/.test(value.recipient_key_id)||fromB64url(value.public_seed).length!==32)throw new Error("Public binding Ephemeral-R tidak valid.");decodeSignedVector(value.B_b);
     if(fromB64url(value.transcript_hash).length!==32||fromB64url(value.wrap_nonce).length!==12||fromB64url(value.wrapped_file_key).length!==48||fromB64url(value.sender_signature).length!==512)throw new Error("Encoding envelope Ephemeral-R tidak valid.");

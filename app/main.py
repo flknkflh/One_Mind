@@ -63,16 +63,18 @@ ACCOUNT_STATUSES = ("PENDING", "ACTIVE", "REJECTED", "DELETED")
 CERTIFICATE_STATUSES = ("NONE", "ISSUED", "REVOKED", "EXPIRED", "REPLACED")
 FILE_STORAGE_FORMAT = "chunked-v1"
 DIPP_PROTOCOL = "ONE_MIND_DIPP_EPHEMERAL_R_STANDALONE"
-DIPP_PROTOCOL_VERSION = 2
-DIPP_PARAMETER_SET = "ER-DIPP-64-16-W8-v2"
-DIPP_ENVELOPE_VERSION = "ONE_MIND-DIPP-EPHEMERAL-R-WEIGHTED-v2"
-DIPP_FILE_PROTOCOL_VERSION = "ONE_MIND_DIPP_EPHEMERAL_R_WEIGHTED_V2"
-DIPP_GEOMETRY_PROFILE = "FIXED-WEISZFELD-24-WEIGHTED-8"
-DIPP_KEY_ESTABLISHMENT = "DIPP-ER-WEIGHTED-v2"
+DIPP_PROTOCOL_VERSION = 5
+DIPP_PARAMETER_SET = "ER-DIPP-64-16-W8-E2048-R10S12S-Q2500K-v5"
+DIPP_ENVELOPE_VERSION = "ONE_MIND-DIPP-EPHEMERAL-R-WEIGHTED-E2048-R10S12S-Q2500K-v5"
+DIPP_FILE_PROTOCOL_VERSION = "ONE_MIND_DIPP_EPHEMERAL_R_WEIGHTED_E2048_R10S12S_Q2500K_V5"
+DIPP_GEOMETRY_PROFILE = "FIXED-WEISZFELD-24-WEIGHTED-8-R10S12S"
+DIPP_KEY_ESTABLISHMENT = "DIPP-ER-WEIGHTED-E2048-R10S12S-Q2500K-v5"
+DIPP_KEY_ID_DOMAIN = b"DIPP-ER-WEIGHTED-E2048-R10S12S-Q2500K-KEY-ID-v5"
 DIPP_VECTOR_BYTES = 64 * 4
 DIPP_COMPONENT_COUNT = 256
 DIPP_MODULUS = 65536
 DIPP_MAX_COORDINATE_ABS = 34_000_000
+DIPP_SESSION_BYTES = 24
 USERNAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{2,79}$"
 OPAQUE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$"
 MAX_FILE_BYTES = 20 * 1024 * 1024 * 1024
@@ -88,6 +90,13 @@ MAX_AUTHORIZATION_HEADER_BYTES = 4096
 def reject_control_characters(value: str) -> str:
     if any(unicodedata.category(char) in {"Cc", "Cf", "Cs"} for char in value):
         raise ValueError("Karakter kontrol tidak diperbolehkan.")
+    return value
+
+
+def validate_plain_text(value: str) -> str:
+    reject_control_characters(value)
+    if "<" in value or ">" in value:
+        raise ValueError("Markup HTML tidak diperbolehkan.")
     return value
 
 
@@ -114,17 +123,17 @@ OpaqueId = Annotated[
 DisplayName = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=160),
-    AfterValidator(reject_control_characters),
+    AfterValidator(validate_plain_text),
 ]
 ShortText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=80),
-    AfterValidator(reject_control_characters),
+    AfterValidator(validate_plain_text),
 ]
 ReasonText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, max_length=500),
-    AfterValidator(reject_control_characters),
+    AfterValidator(validate_plain_text),
 ]
 FilenameText = Annotated[
     str,
@@ -137,7 +146,7 @@ PathChunkIndex = Annotated[int, ApiPath(ge=0, lt=MAX_TOTAL_CHUNKS)]
 
 
 class StrictInputModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 def bearer_token(authorization: str | None, detail: str) -> str:
@@ -230,6 +239,7 @@ def validate_file_envelope(
     value: dict,
     *,
     expected_filename: str,
+    expected_version: int,
     allow_ciphertext: bool,
 ) -> bytes | None:
     if not isinstance(value, dict):
@@ -238,12 +248,16 @@ def validate_file_envelope(
         "version", "algorithm", "protocol_version", "file_context_id",
         "filename", "mime", "aad_b64", "iv_b64",
     }
-    optional = {"file_id", "uploaded_at"}
+    optional = {"file_id"}
     if allow_ciphertext:
         required.add("ciphertext_b64")
     if not required.issubset(value) or set(value) - required - optional:
         raise HTTPException(status_code=400, detail="Schema envelope file tidak canonical.")
-    if not isinstance(value["version"], int) or isinstance(value["version"], bool) or not 1 <= value["version"] <= 1_000_000:
+    if (
+        not isinstance(value["version"], int)
+        or isinstance(value["version"], bool)
+        or value["version"] != expected_version
+    ):
         raise HTTPException(status_code=400, detail="Versi envelope file tidak valid.")
     if value["algorithm"] != "AES-256-GCM" or value["protocol_version"] != DIPP_FILE_PROTOCOL_VERSION:
         raise HTTPException(status_code=400, detail="Algoritme atau protocol envelope file tidak dikenal.")
@@ -279,10 +293,6 @@ def validate_file_envelope(
         or not re.fullmatch(OPAQUE_ID_PATTERN, value["file_id"])
     ):
         raise HTTPException(status_code=400, detail="file_id envelope tidak valid.")
-    if "uploaded_at" in value and (
-        not isinstance(value["uploaded_at"], str) or len(value["uploaded_at"]) > 64
-    ):
-        raise HTTPException(status_code=400, detail="uploaded_at envelope tidak valid.")
     if allow_ciphertext:
         return decode_standard_b64(
             value["ciphertext_b64"],
@@ -383,8 +393,13 @@ def validate_dipp_wrapped_key(value: dict) -> None:
         "key_establishment": DIPP_KEY_ESTABLISHMENT,
     }:
         raise HTTPException(status_code=400, detail="Suite algoritme Ephemeral-R tidak canonical.")
-    for field in ("session_id", "file_context_id", "sender_id", "recipient_id"):
-        if not isinstance(value[field], str) or not value[field] or len(value[field]) > 160:
+    validate_dipp_b64url(value["session_id"], DIPP_SESSION_BYTES, "session_id")
+    validate_dipp_b64url(value["file_context_id"], 24, "file_context_id")
+    for field in ("sender_id", "recipient_id"):
+        if (
+            not isinstance(value[field], str)
+            or not re.fullmatch(USERNAME_PATTERN, value[field])
+        ):
             raise HTTPException(status_code=400, detail=f"Field {field} tidak valid.")
     if not isinstance(value["recipient_key_id"], str) or not secrets.compare_digest(
         value["recipient_key_id"], value["recipient_key_id"].lower()
@@ -449,7 +464,7 @@ def validate_dipp_public_identity(value: dict, username: str) -> None:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="key_id Ephemeral-R tidak valid.") from exc
     expected_key_id = hashlib.sha256(
-        b"DIPP-ER-WEIGHTED-KEY-ID-v2"
+        DIPP_KEY_ID_DOMAIN
         + username.encode("utf-8")
         + base64.urlsafe_b64decode(value["public_seed"] + "=" * (-len(value["public_seed"]) % 4))
         + base64.urlsafe_b64decode(value["B_b"] + "=" * (-len(value["B_b"]) % 4))
@@ -1364,6 +1379,11 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
+    if request.url.path.startswith("/api/") and request.query_params:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Query parameter tidak didukung pada endpoint ini."},
+        )
     if request.url.path.startswith("/api/") and request.method in {"POST", "PUT", "PATCH"}:
         content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
@@ -3057,6 +3077,7 @@ def upload_finish(
         validate_file_envelope(
             data.envelope,
             expected_filename=row["filename"],
+            expected_version=1,
             allow_ciphertext=False,
         )
         if data.wrapped_key_for_owner["file_context_id"] != data.envelope["file_context_id"]:
@@ -3477,24 +3498,6 @@ def update_file_visibility(
 
 @app.put("/api/files/{file_id}")
 def update_file(file_id: PathOpaqueId, data: FileUpdateIn, username: str = Depends(current_user)):
-    ciphertext = validate_file_envelope(
-        data.envelope,
-        expected_filename=data.filename,
-        allow_ciphertext=True,
-    )
-    if data.envelope.get("file_id") not in {None, file_id}:
-        raise HTTPException(status_code=400, detail="file_id envelope tidak cocok dengan target update.")
-    recipients = [item.recipient for item in data.wrapped_keys]
-    if len(set(recipients)) != len(recipients):
-        raise HTTPException(status_code=400, detail="Penerima wrapped key tidak boleh duplikat.")
-    for wrapped_key in data.wrapped_keys:
-        validate_dipp_wrapped_key(wrapped_key.wrapped_key)
-        if wrapped_key.wrapped_key["recipient_id"] != wrapped_key.recipient:
-            raise HTTPException(status_code=400, detail="recipient_id wrapped key tidak cocok.")
-        if wrapped_key.wrapped_key["sender_id"] != username:
-            raise HTTPException(status_code=400, detail="sender_id wrapped key tidak cocok.")
-        if wrapped_key.wrapped_key["file_context_id"] != data.envelope["file_context_id"]:
-            raise HTTPException(status_code=400, detail="File context wrapped key tidak cocok dengan envelope.")
     conn = db()
     staging_dir = None
     backup_dir = None
@@ -3511,6 +3514,68 @@ def update_file(file_id: PathOpaqueId, data: FileUpdateIn, username: str = Depen
                 status_code=409,
                 detail="Format penyimpanan file tidak dapat di-update.",
             )
+
+        active_envelope_path = envelope_path(file_id, create_dir=False)
+        try:
+            if (
+                not active_envelope_path.is_file()
+                or active_envelope_path.stat().st_size > 64 * 1024
+            ):
+                raise ValueError
+            active_envelope = json.loads(
+                active_envelope_path.read_text(encoding="utf-8")
+            )
+            active_version = active_envelope["version"]
+            active_uploaded_at = active_envelope["uploaded_at"]
+            if (
+                not isinstance(active_version, int)
+                or isinstance(active_version, bool)
+                or active_version < 1
+                or not isinstance(active_uploaded_at, str)
+                or len(active_uploaded_at) > 64
+            ):
+                raise ValueError
+            datetime.fromisoformat(active_uploaded_at)
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="Envelope file aktif tidak valid.",
+            ) from exc
+
+        ciphertext = validate_file_envelope(
+            data.envelope,
+            expected_filename=data.filename,
+            expected_version=active_version + 1,
+            allow_ciphertext=True,
+        )
+        if data.envelope.get("file_id") not in {None, file_id}:
+            raise HTTPException(
+                status_code=400,
+                detail="file_id envelope tidak cocok dengan target update.",
+            )
+        recipients = [item.recipient for item in data.wrapped_keys]
+        if len(set(recipients)) != len(recipients):
+            raise HTTPException(
+                status_code=400,
+                detail="Penerima wrapped key tidak boleh duplikat.",
+            )
+        for wrapped_key in data.wrapped_keys:
+            validate_dipp_wrapped_key(wrapped_key.wrapped_key)
+            if wrapped_key.wrapped_key["recipient_id"] != wrapped_key.recipient:
+                raise HTTPException(
+                    status_code=400,
+                    detail="recipient_id wrapped key tidak cocok.",
+                )
+            if wrapped_key.wrapped_key["sender_id"] != username:
+                raise HTTPException(
+                    status_code=400,
+                    detail="sender_id wrapped key tidak cocok.",
+                )
+            if wrapped_key.wrapped_key["file_context_id"] != data.envelope["file_context_id"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail="File context wrapped key tidak cocok dengan envelope.",
+                )
 
         if not ciphertext:
             raise HTTPException(status_code=400, detail="Ciphertext update kosong.")
@@ -3530,6 +3595,8 @@ def update_file(file_id: PathOpaqueId, data: FileUpdateIn, username: str = Depen
 
         envelope = data.envelope.copy()
         envelope.pop("ciphertext_b64", None)
+        envelope["file_id"] = file_id
+        envelope["uploaded_at"] = active_uploaded_at
         envelope["storage_format"] = FILE_STORAGE_FORMAT
         envelope["chunk_size"] = chunk_size
         envelope["total_chunks"] = total_chunks

@@ -85,7 +85,7 @@ class ChunkDownloadTests(unittest.TestCase):
         ).encode("utf-8")
         ciphertext = AESGCM(key).encrypt(iv, plaintext, aad)
         envelope = {
-            "version": 2,
+            "version": 1,
             "algorithm": "AES-256-GCM",
             "protocol_version": main.DIPP_FILE_PROTOCOL_VERSION,
             "file_context_id": b64url(hashlib.sha256(plaintext).digest()[:24]),

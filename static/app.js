@@ -885,9 +885,35 @@ async function importRSAEnrollmentKey(
     const identity =
         JSON.parse(text);
 
+    const requiredFields = [
+        "version",
+        "type",
+        "username",
+        "created_at",
+        "public_key",
+        "private_key"
+    ];
+
     if (
+        !identity ||
+        typeof identity !== "object" ||
+        Array.isArray(identity) ||
+        Object.keys(identity).length !== requiredFields.length ||
+        requiredFields.some(field =>
+            !Object.prototype.hasOwnProperty.call(identity, field)
+        ) ||
+        identity.version !== 1 ||
         identity.type !==
-        "ONE_MIND_RSA_ENROLLMENT"
+        "ONE_MIND_RSA_ENROLLMENT" ||
+        typeof identity.username !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]{2,79}$/.test(identity.username) ||
+        typeof identity.created_at !== "string" ||
+        Number.isNaN(Date.parse(identity.created_at)) ||
+        new Date(identity.created_at).toISOString() !== identity.created_at ||
+        typeof identity.public_key !== "string" ||
+        typeof identity.private_key !== "string" ||
+        !identity.public_key ||
+        !identity.private_key
     ) {
 
         throw new Error(
@@ -1278,11 +1304,11 @@ async function encryptBlob(blob, fileName, mimeType, key = null) {
 
         envelope: {
 
-            version: 2,
+            version: 1,
 
             algorithm: "AES-256-GCM",
 
-            protocol_version: "ONE_MIND_DIPP_EPHEMERAL_R_WEIGHTED_V2",
+            protocol_version: "ONE_MIND_DIPP_EPHEMERAL_R_WEIGHTED_E2048_R10S12S_Q2500K_V5",
 
             file_context_id: OneMindDippEphemeralR.b64url(
                 crypto.getRandomValues(new Uint8Array(24))
@@ -1693,9 +1719,6 @@ async function updateFileWithRotation(fileId, replacementFile) {
     encrypted.envelope.file_id =
         current.file.envelope.file_id;
 
-    encrypted.envelope.uploaded_at =
-        current.file.envelope.uploaded_at;
-
     encrypted.envelope.version =
         (current.file.envelope.version || 1) + 1;
 
@@ -1765,9 +1788,6 @@ async function rotateCurrentFileKey(fileId) {
 
     encrypted.envelope.version =
         (current.file.envelope.version || 1) + 1;
-
-    encrypted.envelope.uploaded_at =
-        current.file.envelope.uploaded_at;
 
     // =====================================
 

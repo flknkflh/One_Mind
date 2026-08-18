@@ -19,7 +19,7 @@ def make_user_material(username: str) -> tuple[dict, object, str]:
         for index in range(main.DIPP_VECTOR_BYTES // 4)
     )
     key_id = hashlib.sha256(
-        b"DIPP-ER-WEIGHTED-KEY-ID-v2" + username.encode() + seed + vector
+        main.DIPP_KEY_ID_DOMAIN + username.encode() + seed + vector
     ).hexdigest()
     public_identity = {
         "protocol": main.DIPP_PROTOCOL,
@@ -59,7 +59,9 @@ def wrapped_key(
         "recipient_key_id": recipient_public["key_id"],
         "public_seed": recipient_public["public_seed"],
         "B_b": recipient_public["B_b"],
-        "session_id": f"session-{marker}",
+        "session_id": b64url(
+            hashlib.sha256(f"session:{marker}".encode()).digest()[:main.DIPP_SESSION_BYTES]
+        ),
         "file_context_id": file_context_id or b64url(
             hashlib.sha256(f"context:{marker}".encode()).digest()[:24]
         ),
